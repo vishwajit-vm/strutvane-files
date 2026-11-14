@@ -1,0 +1,128 @@
+{
+  "name": "@strutvane/files",
+  "version": "0.1.0-next.0",
+  "description": "Cloud storage disks (S3, R2, MinIO, Azure Blob), file and image fields, magic-byte validation, EXIF/GPS stripping, virus scanning, per-tenant quotas, attachments with orphan cleanup, and presigned direct-to-cloud uploads.",
+  "keywords": [
+    "strutvane",
+    "file-upload",
+    "storage",
+    "s3",
+    "azure-blob",
+    "minio",
+    "r2",
+    "image",
+    "clamav",
+    "typescript"
+  ],
+  "homepage": "https://github.com/vishwajit-vm/strutvane-files#readme",
+  "bugs": {
+    "url": "https://github.com/vishwajit-vm/strutvane-files/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vishwajit-vm/strutvane-files.git"
+  },
+  "license": "MIT",
+  "author": "The Strutvane Authors",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "default": "./dist/index.mjs"
+    },
+    "./s3": {
+      "types": "./dist/s3.d.mts",
+      "default": "./dist/s3.mjs"
+    },
+    "./azure": {
+      "types": "./dist/azure.d.mts",
+      "default": "./dist/azure.mjs"
+    },
+    "./images": {
+      "types": "./dist/images.d.mts",
+      "default": "./dist/images.mjs"
+    },
+    "./clamav": {
+      "types": "./dist/clamav.d.mts",
+      "default": "./dist/clamav.mjs"
+    },
+    "./sql": {
+      "types": "./dist/sql.d.mts",
+      "default": "./dist/sql.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "pnpm@12.18.0",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:perf": "vitest run --config vitest.perf.config.ts",
+    "build": "tsdown",
+    "ci": "biome check . && tsc --noEmit && vitest run --coverage && tsdown",
+    "changeset": "changeset",
+    "version-packages": "changeset version",
+    "release": "changeset publish"
+  },
+  "dependencies": {
+    "@strutvane/contracts": "0.1.0-next.0",
+    "@strutvane/core": "0.1.0-next.0"
+  },
+  "peerDependencies": {
+    "@aws-sdk/client-s3": "^3.1100.0",
+    "@aws-sdk/s3-request-presigner": "^3.1100.0",
+    "@azure/identity": "^4.10.0",
+    "@azure/storage-blob": "^12.28.0",
+    "sharp": "^0.35.0"
+  },
+  "peerDependenciesMeta": {
+    "@aws-sdk/client-s3": {
+      "optional": true
+    },
+    "@aws-sdk/s3-request-presigner": {
+      "optional": true
+    },
+    "@azure/identity": {
+      "optional": true
+    },
+    "@azure/storage-blob": {
+      "optional": true
+    },
+    "sharp": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@aws-sdk/client-s3": "3.1168.0",
+    "@aws-sdk/s3-request-presigner": "3.1168.0",
+    "@azure/identity": "4.14.1",
+    "@azure/storage-blob": "12.34.0",
+    "@biomejs/biome": "2.6.7",
+    "@changesets/cli": "3.0.3",
+    "@types/node": "24.19.2",
+    "@types/pg": "8.23.1",
+    "@vitest/coverage-v8": "5.1.0",
+    "fast-check": "4.10.2",
+    "pg": "8.23.1",
+    "sharp": "0.35.5",
+    "tsdown": "0.23.7",
+    "typescript": "6.0.3",
+    "vitest": "5.1.0"
+  }
+}
