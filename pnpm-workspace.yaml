@@ -1,10 +1,7 @@
-# TEMPORARY (ADR-0016): link the sibling contracts and core checkouts until
-# @strutvane/contracts@0.1.0-next.0 and @strutvane/core@0.1.0-next.0 are published. Remove these
-# overrides before pushing; CI's check-deps step rejects them.
-overrides:
-  "@strutvane/contracts": link:../contracts
-  "@strutvane/core": link:../core
-
 # sharp ships a prebuilt native binary through an install script.
 onlyBuiltDependencies:
   - sharp
+# Our own pre-releases are staged and approved with 2FA (ADR-0018), so they are exempt from
+# pnpm's minimum release age; every third-party package keeps the protection.
+minimumReleaseAgeExclude:
+  - "@strutvane/*"

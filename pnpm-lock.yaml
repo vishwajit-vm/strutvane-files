@@ -162,20 +162,16 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
-overrides:
-  '@strutvane/contracts': link:../contracts
-  '@strutvane/core': link:../core
-
 importers:
 
   .:
     dependencies:
       '@strutvane/contracts':
-        specifier: link:../contracts
-        version: link:../contracts
+        specifier: 0.1.0-next.0
+        version: 0.1.0-next.0
       '@strutvane/core':
-        specifier: link:../core
-        version: link:../core
+        specifier: 0.1.0-next.0
+        version: 0.1.0-next.0
     devDependencies:
       '@aws-sdk/client-s3':
         specifier: 3.1168.0
@@ -982,6 +978,14 @@ packages:
   '@smithy/types@4.20.0':
     resolution: {integrity: sha512-lCA6QG22dPk9ecHbv91jDQZsmtPUjdS1aE2Il6NNPqe7DrYc0dZQi6DhcESk2KYXH2sp5xbAcGdYMZDFnuzA2A==}
     engines: {node: '>=18.0.0'}
+
+  '@strutvane/contracts@0.1.0-next.0':
+    resolution: {integrity: sha512-Uby7JdYJED6BPI44lXMsw4brpUjgQ9RL+4KuU3VyMuPBgnKY8zuDpy0leSkZOZNif2r3iX6GauzyHqhOlGzW4w==}
+    engines: {node: '>=24'}
+
+  '@strutvane/core@0.1.0-next.0':
+    resolution: {integrity: sha512-dH/uF0BlxiLvPoe3WhgqVvGpJrjnQ7CLxo8ETOXGpTZNt1AQ142KdbUnhGcJ0oWodgyRHqi/wYp7x1Azo5UTbw==}
+    engines: {node: '>=24'}
 
   '@tybys/wasm-util@0.10.4':
     resolution: {integrity: sha512-W3c4gRigFS0T/Ma4qIYF3GDAc5AQdHb1yL5znJT1Zv1YaD9Kitx656wBjvr19qbiosmZT8lWDM5BEMynUqX65A==}
@@ -2552,6 +2556,12 @@ snapshots:
   '@smithy/types@4.20.0':
     dependencies:
       tslib: 2.9.1
+
+  '@strutvane/contracts@0.1.0-next.0': {}
+
+  '@strutvane/core@0.1.0-next.0':
+    dependencies:
+      '@strutvane/contracts': 0.1.0-next.0
 
   '@tybys/wasm-util@0.10.4':
     dependencies:
