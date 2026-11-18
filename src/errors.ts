@@ -118,16 +118,26 @@ export class FileInfectedError extends StrutvaneError {
   }
 }
 
-/** Accepting the file would exceed the tenant's storage quota. 422. */
+/**
+ * Accepting the file would exceed a storage quota. 422. `scope` says which one: the tenant's
+ * (default) or the uploading user's (`owner`).
+ */
 export class QuotaExceededError extends StrutvaneError {
   constructor(params: {
     readonly limit: number
     readonly used: number
     readonly requested: number
+    readonly scope?: 'tenant' | 'owner'
   }) {
     super('quota_exceeded', {
       status: 422,
-      params: { ...params, available: Math.max(0, params.limit - params.used) },
+      params: {
+        limit: params.limit,
+        used: params.used,
+        requested: params.requested,
+        available: Math.max(0, params.limit - params.used),
+        scope: params.scope ?? 'tenant',
+      },
     })
   }
 }

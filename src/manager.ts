@@ -9,8 +9,26 @@
  *   file `deleted` (reference counting).
  * - {@link FileManager.createDirectUpload} / {@link FileManager.confirmDirectUpload}:
  *   presigned direct-to-cloud uploads with a server-side confirm step.
+ * - {@link FileManager.createResumableUpload} → {@link FileManager.presignResumableParts} →
+ *   {@link FileManager.completeResumableUpload}: resumable direct uploads for large files, on
+ *   the provider's own multipart protocol (see "Resumable uploads" below).
  * - {@link FileManager.open} / {@link FileManager.temporaryUrl}: tenant-checked downloads.
  * - {@link FileManager.cleanup}: the orphan job (expired uploads, never-committed files, purges).
+ *
+ * **Quotas:** bytes are reserved against the tenant's quota and, when the upload names an
+ * `ownerId`, the uploading user's quota, *before* any byte is accepted; both are released again
+ * on every failure path and when the file is purged.
+ *
+ * **Resumable uploads** (RFC-0002 open question 1, decided): the provider's native multipart
+ * protocol, not tus. The browser sends each part straight to S3 or Azure with a short-lived URL
+ * for that one part, so the app server carries no bytes and keeps no chunk state; a dropped
+ * connection costs one part, and `resumableUploadStatus` tells the client which parts to resend.
+ * tus would route every byte through the app (or a tus server) and need its own chunk storage and
+ * cleanup. The price: resumable uploads need a disk that implements `ResumableDisk` (the S3 and
+ * Azure disks do; the framework's `local` disk does not). Limits: the declared size is checked
+ * against the rules first, the part size is the server's choice, every part's size is checked
+ * against the plan before completion (and signed into the URL on S3), and the completed object
+ * then goes through exactly the confirm pipeline of a single direct upload.
  *
  * Every failure path leaves no half-saved state: bytes are deleted, quota is released, temp
  * files are removed, and anything a crash interrupts is found and finished by `cleanup`.
@@ -24,12 +42,21 @@ import type {
   Logger,
   StorageDisk,
 } from '@strutvane/framework/contracts'
-import { type Clock, NotFoundError, systemClock, uuidv7, ValidationError } from '@strutvane/framework/core'
+import {
+  type Clock,
+  NotFoundError,
+  systemClock,
+  uuidv7,
+  ValidationError,
+} from '@strutvane/framework/core'
 import {
   type DirectUploadTarget,
   type FilesTemporaryUrlOptions,
   isPresigning,
+  isResumable,
   putSpooled,
+  type ResumableDisk,
+  type UploadedPart,
 } from './disk.ts'
 import {
   FileInfectedError,
@@ -41,8 +68,8 @@ import type { ImageProcessor } from './image-processor.ts'
 import { type InspectedUpload, inspectUpload } from './inspect.ts'
 import { assertSafeSegment, contentDisposition, generateFileKey, sanitizeFileName } from './keys.ts'
 import { ACTIVE_CONTENT } from './mime.ts'
-import type { QuotaGuard } from './quota.ts'
-import type { FileRecord, FileRecordStore, FileStatus } from './records.ts'
+import { assertOwnerId, type OwnerQuotaGuard, type QuotaGuard } from './quota.ts'
+import type { FileRecord, FileRecordStore, FileStatus, ResumableSession } from './records.ts'
 import { ensureResolved, type FileRules, type ResolvedRules } from './rules.ts'
 import {
   type ScanFailurePolicy,
@@ -83,7 +110,12 @@ export interface FileManagerOptions {
   /** Disk used when a call names none. */
   readonly defaultDisk: string
   readonly store: FileRecordStore
+  /** Per-tenant quota. */
   readonly quota?: QuotaGuard
+  /** Per-user quota, applied to uploads that name an `ownerId`. */
+  readonly ownerQuota?: OwnerQuotaGuard
+  /** Resumable upload settings. */
+  readonly resumable?: ResumableOptions
   readonly scanner?: VirusScanner
   /** What to do when the scanner is down. Default `fail-closed`. */
   readonly scanPolicy?: ScanFailurePolicy
@@ -108,6 +140,17 @@ export interface FileManagerOptions {
 
 type Path = readonly (string | number)[]
 
+/** Settings for resumable uploads. */
+export interface ResumableOptions {
+  /**
+   * Preferred part size in bytes. Default 8 MiB. Raised automatically to the disk's minimum and
+   * to whatever keeps the part count within the disk's limit.
+   */
+  readonly partSize?: number
+  /** Most part URLs one {@link FileManager.presignResumableParts} call signs. Default 100. */
+  readonly maxPartsPerRequest?: number
+}
+
 /** Input for {@link FileManager.store}. */
 export interface StoreInput {
   /** The bytes, or an already spooled file (the framework's `UploadedFile` temp file). */
@@ -121,6 +164,8 @@ export interface StoreInput {
   readonly disk?: string
   /** Default `private`. */
   readonly visibility?: FileVisibility
+  /** The uploading user (from your auth layer, never the client), for per-user quotas. */
+  readonly ownerId?: string
   /** Where the file sits in the input, for validation issues. Default `[]`. */
   readonly path?: Path
   readonly signal?: AbortSignal
@@ -152,7 +197,46 @@ export interface DirectUploadInput {
   readonly visibility?: FileVisibility
   /** Upload URL lifetime. Default 300 seconds. */
   readonly expiresInSeconds?: number
+  /** The uploading user (from your auth layer, never the client), for per-user quotas. */
+  readonly ownerId?: string
   readonly path?: Path
+}
+
+/** What the client needs to run a resumable upload. */
+export interface ResumableUpload {
+  readonly fileId: string
+  /** Bytes per part; every part except the last has exactly this size. */
+  readonly partSize: number
+  readonly partCount: number
+}
+
+/** Input for {@link FileManager.presignResumableParts}. */
+export interface PresignPartsInput {
+  readonly tenantId: string | null
+  readonly fileId: string
+  /** 1-based part numbers to sign (at most `maxPartsPerRequest`). */
+  readonly partNumbers: readonly number[]
+  /** URL lifetime. Default 300 seconds. */
+  readonly expiresInSeconds?: number
+}
+
+/** One signed part URL. */
+export interface PresignedPart {
+  readonly partNumber: number
+  /** Exact bytes this part must have. */
+  readonly size: number
+  readonly upload: DirectUploadTarget
+}
+
+/** Where a resumable upload stands, so a client can resume after a lost connection. */
+export interface ResumableStatus {
+  readonly fileId: string
+  readonly partSize: number
+  readonly partCount: number
+  /** Parts the provider has, with the right size. */
+  readonly uploadedParts: readonly number[]
+  /** Parts still to send (or to send again: a part with the wrong size counts as missing). */
+  readonly missingParts: readonly number[]
 }
 
 /** What the client needs to upload directly. */
@@ -219,6 +303,19 @@ export interface FileManager {
   ): Promise<string>
   createDirectUpload(input: DirectUploadInput): Promise<DirectUpload>
   confirmDirectUpload(input: ConfirmInput): Promise<FileRecord>
+  /** Start a resumable upload (checks rules and quotas against the declared size). */
+  createResumableUpload(input: DirectUploadInput): Promise<ResumableUpload>
+  /** Signed URLs for some parts of a resumable upload. */
+  presignResumableParts(input: PresignPartsInput): Promise<readonly PresignedPart[]>
+  /** Which parts the provider has received so far. */
+  resumableUploadStatus(tenantId: string | null, fileId: string): Promise<ResumableStatus>
+  /**
+   * Complete a resumable upload: verify every part against the plan, assemble the object, then
+   * run the same checks as {@link FileManager.confirmDirectUpload}. Idempotent.
+   */
+  completeResumableUpload(input: ConfirmInput): Promise<FileRecord>
+  /** Cancel a resumable upload: discard its parts, its row and its quota. */
+  abortResumableUpload(tenantId: string | null, fileId: string): Promise<void>
   scanStored(tenantId: string | null, fileId: string): Promise<FileRecord>
   markScanned(tenantId: string | null, fileId: string, verdict: ScanVerdict): Promise<FileRecord>
   cleanup(options?: CleanupOptions): Promise<CleanupReport>
@@ -237,6 +334,7 @@ const SILENT: Logger = {
 }
 
 const HOUR = 3_600_000
+const MiB = 1024 * 1024
 /** An `updatedAt` that is older than any retention period. */
 const EXPIRED = new Date(0).toISOString()
 const SERVABLE_STATUS: ReadonlySet<FileStatus> = new Set(['pending', 'committed'])
@@ -307,9 +405,24 @@ export function createFileManager(options: FileManagerOptions): FileManager {
     }
   }
 
+  /** Discard a resumable upload's provider-side parts (best effort; they also expire). */
+  const abortParts = async (record: FileRecord): Promise<void> => {
+    const disk = options.disks[record.disk]
+    if (!record.upload || !disk || !isResumable(disk)) return
+    try {
+      await disk.abortMultipartUpload(record.key, record.upload.id)
+    } catch (error) {
+      log.warn('could not abort a resumable upload; the provider expires it', {
+        fileId: record.id,
+        ...errorFields(error),
+      })
+    }
+  }
+
   /** Best-effort removal of bytes + row + quota after a failed upload. */
   const rollback = async (record: FileRecord, releaseQuota: () => Promise<void>): Promise<void> => {
     const disk = options.disks[record.disk]
+    await abortParts(record)
     try {
       await disk?.delete(record.key)
       await baseStore.remove(record.tenantId, record.id)
@@ -357,11 +470,47 @@ export function createFileManager(options: FileManagerOptions): FileManager {
       : {}),
   })
 
-  const reserve = async (tenantId: string | null, bytes: number): Promise<() => Promise<void>> =>
-    options.quota ? options.quota.reserve(tenantId, bytes) : async () => {}
+  /**
+   * Reserve bytes against the tenant quota and, with an owner, the owner's quota. All or nothing:
+   * if the owner's quota refuses, the tenant reservation is given back before the error surfaces.
+   */
+  const reserve = async (
+    tenantId: string | null,
+    ownerId: string | undefined,
+    bytes: number,
+  ): Promise<() => Promise<void>> => {
+    const releaseTenant = options.quota
+      ? await options.quota.reserve(tenantId, bytes)
+      : async () => {}
+    if (ownerId === undefined || !options.ownerQuota) return releaseTenant
+    let releaseOwner: () => Promise<void>
+    try {
+      releaseOwner = await options.ownerQuota.reserve(tenantId, ownerId, bytes)
+    } catch (error) {
+      await releaseTenant()
+      throw error
+    }
+    return async () => {
+      await releaseTenant()
+      await releaseOwner()
+    }
+  }
 
-  const releaseBytes = async (tenantId: string | null, bytes: number): Promise<void> => {
-    if (options.quota && bytes > 0) await options.quota.release(tenantId, bytes)
+  const releaseBytes = async (
+    tenantId: string | null,
+    ownerId: string | undefined,
+    bytes: number,
+  ): Promise<void> => {
+    if (bytes <= 0) return
+    if (options.quota) await options.quota.release(tenantId, bytes)
+    if (ownerId !== undefined && options.ownerQuota)
+      await options.ownerQuota.release(tenantId, ownerId, bytes)
+  }
+
+  const owner = (ownerId: string | undefined): { readonly ownerId?: string } => {
+    if (ownerId === undefined) return {}
+    assertOwnerId(ownerId)
+    return { ownerId }
   }
 
   const commitInto = async (store: FileRecordStore, input: AttachInput): Promise<FileRecord[]> => {
@@ -416,11 +565,246 @@ export function createFileManager(options: FileManagerOptions): FileManager {
     return deleted
   }
 
+  const partsPerRequest = options.resumable?.maxPartsPerRequest ?? 100
+
+  /**
+   * The checks and bookkeeping every direct upload (single or resumable) starts with: the
+   * declared size and type against the rules, quota reservation for the declared size, and the
+   * intent row (`uploading`) written before anything reaches the provider.
+   */
+  const planDirectUpload = async (
+    input: DirectUploadInput,
+    disk: StorageDisk,
+    upload: (record: FileRecord) => Promise<ResumableSession | undefined>,
+  ): Promise<FileRecord> => {
+    const rules = ensureResolved(input.rules)
+    const path = input.path ?? []
+    assertSafeSegment(input.resource, 'resource')
+    const ownerFields = owner(input.ownerId)
+    if (!Number.isSafeInteger(input.size) || input.size < 0)
+      throw new RangeError('size must be a whole number of bytes')
+    const issues = [...checkSize(input.size, rules, path)]
+    if (issues.length === 0) issues.push(...checkType(input.contentType, rules, path))
+    if (issues.length > 0) throw new ValidationError(issues)
+    const release = await reserve(input.tenantId, input.ownerId, input.size)
+    const now = nowIso()
+    const draft: FileRecord = {
+      id: newId(),
+      tenantId: input.tenantId,
+      disk: disk.name,
+      key: generateFileKey({
+        tenantId: input.tenantId,
+        resource: input.resource,
+        contentType: input.contentType,
+        id: newId,
+      }),
+      size: input.size,
+      contentType: input.contentType.toLowerCase(),
+      sha256: '',
+      originalName: sanitizeFileName(input.clientName),
+      visibility: input.visibility ?? 'private',
+      status: 'uploading',
+      scanStatus: 'not-scanned',
+      ...ownerFields,
+      createdAt: now,
+      updatedAt: now,
+    }
+    let record = draft
+    try {
+      // The provider session is opened before the row is written, so the row always names it
+      // and cleanup can abort it; a crash in between leaves only an expiring provider session.
+      const session = await upload(draft)
+      record = session === undefined ? draft : { ...draft, upload: session }
+      await baseStore.insert(record)
+    } catch (error) {
+      await abortParts(record)
+      await release()
+      throw error
+    }
+    return record
+  }
+
+  /** The upload a resumable call names: `uploading`, with a session, on a resumable disk. */
+  const resumableRecord = async (
+    tenantId: string | null,
+    fileId: string,
+  ): Promise<{
+    readonly record: FileRecord
+    readonly session: ResumableSession
+    readonly disk: ResumableDisk
+  }> => {
+    const record = await baseStore.get(tenantId, fileId)
+    const disk = record ? options.disks[record.disk] : undefined
+    if (!record?.upload || record.status !== 'uploading' || !disk || !isResumable(disk))
+      throw new NotFoundError('file')
+    return { record, session: record.upload, disk }
+  }
+
+  /** Bytes in part `n` (1-based) of an upload of `size` bytes in parts of `partSize`. */
+  const partBytes = (size: number, partSize: number, n: number): number =>
+    Math.min(partSize, size - (n - 1) * partSize)
+
+  const partCountOf = (size: number, partSize: number): number =>
+    Math.max(1, Math.ceil(size / partSize))
+
+  /** Received parts checked against the plan: which are good, which must be (re)sent. */
+  const checkParts = (
+    record: FileRecord,
+    session: ResumableSession,
+    received: readonly UploadedPart[],
+  ): { readonly good: UploadedPart[]; readonly missing: number[] } => {
+    const byNumber = new Map(received.map((part) => [part.partNumber, part]))
+    const good: UploadedPart[] = []
+    const missing: number[] = []
+    for (let n = 1; n <= partCountOf(record.size, session.partSize); n++) {
+      const part = byNumber.get(n)
+      // A part with the wrong size (possible on Azure, where a SAS can't pin it) is not good:
+      // the client sends it again, and it is never committed.
+      if (part && part.size === partBytes(record.size, session.partSize, n)) good.push(part)
+      else missing.push(n)
+    }
+    return { good, missing }
+  }
+
+  /**
+   * The confirm pipeline shared by single and resumable direct uploads, once the object exists:
+   * size against the declared size, magic-byte type against the declared type, image decode and
+   * strip, scan, quota adjustment for re-encoding, then `pending`. A rejected file is deleted
+   * with its row and quota; a retryable failure (storage or scanner down) leaves the upload
+   * `uploading` so the client can confirm again.
+   */
+  const finalizeUploaded = async (
+    record: FileRecord,
+    rules: ResolvedRules,
+    path: Path,
+    signal: AbortSignal | undefined,
+  ): Promise<FileRecord> => {
+    const disk = diskFor(record.disk)
+    const reject = async (error: unknown): Promise<never> => {
+      await rollback(record, () => releaseBytes(record.tenantId, record.ownerId, record.size))
+      throw error
+    }
+    const stat = await disk.stat(record.key)
+    if (!stat) throw new UploadIncompleteError() // the client may still retry the PUT
+    if (stat.size !== record.size) {
+      if (stat.size > rules.maxSize)
+        return reject(new ValidationError(checkSize(stat.size, rules, path)))
+      return reject(new UploadIncompleteError())
+    }
+    let spooled: SpooledFile
+    try {
+      spooled = await spool(await disk.get(record.key), {
+        maxBytes: rules.maxSize,
+        ...(options.tempDir === undefined ? {} : { tempDir: options.tempDir }),
+        ...(signal ? { signal } : {}),
+      })
+    } catch (error) {
+      if (error instanceof SpoolLimitError)
+        return reject(new ValidationError(checkSize(rules.maxSize + 1, rules, path)))
+      throw error
+    }
+    try {
+      let inspected: InspectedUpload
+      try {
+        inspected = await inspect(spooled, rules, path)
+      } catch (error) {
+        if (error instanceof ValidationError) return await reject(error)
+        throw error
+      }
+      await using _inspected = inspected
+      if (inspected.detectedMime !== record.contentType)
+        // The bytes are not what the client declared (and what the URL was signed for).
+        return await reject(
+          new ValidationError([
+            fileIssue('file_type_not_allowed', path, {
+              accept: rules.accept.join(', '),
+              detected: inspected.detectedMime,
+            }),
+          ]),
+        )
+      let scanStatus: Awaited<ReturnType<typeof scan>>
+      try {
+        scanStatus = await scan(inspected.file, signal)
+      } catch (error) {
+        if (error instanceof ScanUnavailableError) throw error // retryable: keep the upload
+        if (error instanceof FileInfectedError)
+          log.warn('direct upload rejected: malware detected', {
+            tenantId: record.tenantId,
+            fileId: record.id,
+            signature: error.signature,
+          })
+        return await reject(error)
+      }
+      const file = inspected.file
+      // Quota was reserved for the declared size; re-encoding may change it slightly.
+      const delta = file.size - record.size
+      if (delta > 0) {
+        try {
+          await reserve(record.tenantId, record.ownerId, delta)
+        } catch (error) {
+          return await reject(error)
+        }
+      }
+      let updated: FileRecord | undefined
+      try {
+        if (inspected.sanitized) await putSpooled(disk, record.key, file, putOptions(record))
+        updated = await baseStore.update(record.tenantId, record.id, ['uploading'], {
+          status: 'pending',
+          size: file.size,
+          sha256: file.sha256,
+          scanStatus,
+          ...(inspected.width === undefined ? {} : { width: inspected.width }),
+          ...(inspected.height === undefined ? {} : { height: inspected.height }),
+          updatedAt: nowIso(),
+        })
+      } catch (error) {
+        // Storage down: the upload stays `uploading`, so the client can confirm again.
+        if (delta > 0) await releaseBytes(record.tenantId, record.ownerId, delta)
+        throw error
+      }
+      if (!updated) {
+        if (delta > 0) await releaseBytes(record.tenantId, record.ownerId, delta)
+        throw new NotFoundError('file') // cleaned up while we were confirming
+      }
+      if (delta < 0) await releaseBytes(record.tenantId, record.ownerId, -delta)
+      await emit('files.stored', updated)
+      return updated
+    } finally {
+      await spooled.dispose()
+    }
+  }
+
+  /** An upload a confirm call may finish: idempotent for finished ones, 404 for anything else. */
+  const confirmable = async (
+    tenantId: string | null,
+    fileId: string,
+  ): Promise<FileRecord | { readonly done: FileRecord }> => {
+    const record = await baseStore.get(tenantId, fileId)
+    if (!record) throw new NotFoundError('file')
+    if (record.status === 'pending' || record.status === 'committed') return { done: record }
+    if (record.status !== 'uploading') throw new NotFoundError('file')
+    return record
+  }
+
+  /** The part size for a new resumable upload of `size` bytes on `disk`. */
+  const choosePartSize = (disk: ResumableDisk, size: number): number => {
+    const preferred = options.resumable?.partSize ?? 8 * MiB
+    if (!Number.isSafeInteger(preferred) || preferred < 1)
+      throw new RangeError('resumable.partSize must be a whole number of bytes')
+    // Large enough for the provider's minimum and its part limit, rounded up to a whole MiB.
+    const needed = Math.max(preferred, disk.minPartSize, Math.ceil(size / disk.maxParts))
+    const rounded = needed >= MiB ? Math.ceil(needed / MiB) * MiB : needed
+    if (rounded > disk.maxPartSize)
+      throw new RangeError(`Disk "${disk.name}" cannot take ${size} bytes in one upload`)
+    return rounded
+  }
+
   const manager: FileManager = {
     async store(input) {
       const rules = ensureResolved(input.rules)
       const path = input.path ?? []
       assertSafeSegment(input.resource, 'resource')
+      const ownerFields = owner(input.ownerId)
       const disk = diskFor(input.disk)
       let spooled: SpooledFile
       let ownSpool = false
@@ -460,7 +844,7 @@ export function createFileManager(options: FileManagerOptions): FileManager {
             })
           throw error
         })
-        const release = await reserve(input.tenantId, file.size)
+        const release = await reserve(input.tenantId, input.ownerId, file.size)
         const now = nowIso()
         const record: FileRecord = {
           id: newId(),
@@ -479,6 +863,7 @@ export function createFileManager(options: FileManagerOptions): FileManager {
           visibility: input.visibility ?? 'private',
           status: 'uploading',
           scanStatus,
+          ...ownerFields,
           ...(inspected.width === undefined ? {} : { width: inspected.width }),
           ...(inspected.height === undefined ? {} : { height: inspected.height }),
           createdAt: now,
@@ -574,45 +959,10 @@ export function createFileManager(options: FileManagerOptions): FileManager {
     },
 
     async createDirectUpload(input) {
-      const rules = ensureResolved(input.rules)
-      const path = input.path ?? []
-      assertSafeSegment(input.resource, 'resource')
-      if (!Number.isSafeInteger(input.size) || input.size < 0)
-        throw new RangeError('size must be a whole number of bytes')
-      const issues = [...checkSize(input.size, rules, path)]
-      if (issues.length === 0) issues.push(...checkType(input.contentType, rules, path))
-      if (issues.length > 0) throw new ValidationError(issues)
       const disk = diskFor(input.disk)
       if (!isPresigning(disk))
         throw new TypeError(`Disk "${disk.name}" does not support direct uploads`)
-      const release = await reserve(input.tenantId, input.size)
-      const now = nowIso()
-      const record: FileRecord = {
-        id: newId(),
-        tenantId: input.tenantId,
-        disk: disk.name,
-        key: generateFileKey({
-          tenantId: input.tenantId,
-          resource: input.resource,
-          contentType: input.contentType,
-          id: newId,
-        }),
-        size: input.size,
-        contentType: input.contentType.toLowerCase(),
-        sha256: '',
-        originalName: sanitizeFileName(input.clientName),
-        visibility: input.visibility ?? 'private',
-        status: 'uploading',
-        scanStatus: 'not-scanned',
-        createdAt: now,
-        updatedAt: now,
-      }
-      try {
-        await baseStore.insert(record)
-      } catch (error) {
-        await release()
-        throw error
-      }
+      const record = await planDirectUpload(input, disk, async () => undefined)
       try {
         const upload = await disk.presignUpload(record.key, {
           contentType: record.contentType,
@@ -625,105 +975,108 @@ export function createFileManager(options: FileManagerOptions): FileManager {
         })
         return { fileId: record.id, upload }
       } catch (error) {
-        await rollback(record, release)
+        await rollback(record, () => releaseBytes(record.tenantId, record.ownerId, record.size))
         throw error
       }
     },
 
     async confirmDirectUpload(input) {
-      const rules = ensureResolved(input.rules)
-      const path = input.path ?? []
-      const record = await baseStore.get(input.tenantId, input.fileId)
-      if (!record) throw new NotFoundError('file')
-      if (record.status === 'pending' || record.status === 'committed') return record // idempotent
-      if (record.status !== 'uploading') throw new NotFoundError('file')
-      const disk = diskFor(record.disk)
-      const reject = async (error: unknown): Promise<never> => {
-        await rollback(record, () => releaseBytes(record.tenantId, record.size))
-        throw error
-      }
-      const stat = await disk.stat(record.key)
-      if (!stat) throw new UploadIncompleteError() // the client may still retry the PUT
-      if (stat.size !== record.size) {
-        if (stat.size > rules.maxSize)
-          return reject(new ValidationError(checkSize(stat.size, rules, path)))
-        return reject(new UploadIncompleteError())
-      }
-      let spooled: SpooledFile
-      try {
-        spooled = await spool(await disk.get(record.key), {
-          maxBytes: rules.maxSize,
-          ...(options.tempDir === undefined ? {} : { tempDir: options.tempDir }),
-          ...(input.signal ? { signal: input.signal } : {}),
-        })
-      } catch (error) {
-        if (error instanceof SpoolLimitError)
-          return reject(new ValidationError(checkSize(rules.maxSize + 1, rules, path)))
-        throw error
-      }
-      try {
-        let inspected: InspectedUpload
-        try {
-          inspected = await inspect(spooled, rules, path)
-        } catch (error) {
-          if (error instanceof ValidationError) return await reject(error)
-          throw error
-        }
-        await using _inspected = inspected
-        if (inspected.detectedMime !== record.contentType)
-          // The bytes are not what the client declared (and what the URL was signed for).
-          return await reject(
-            new ValidationError([
-              fileIssue('file_type_not_allowed', path, {
-                accept: rules.accept.join(', '),
-                detected: inspected.detectedMime,
-              }),
-            ]),
-          )
-        let scanStatus: Awaited<ReturnType<typeof scan>>
-        try {
-          scanStatus = await scan(inspected.file, input.signal)
-        } catch (error) {
-          if (error instanceof ScanUnavailableError) throw error // retryable: keep the upload
-          return await reject(error)
-        }
-        const file = inspected.file
-        // Quota was reserved for the declared size; re-encoding may change it slightly.
-        const delta = file.size - record.size
-        if (delta > 0) {
-          try {
-            await reserve(record.tenantId, delta)
-          } catch (error) {
-            return await reject(error)
-          }
-        }
-        let updated: FileRecord | undefined
-        try {
-          if (inspected.sanitized) await putSpooled(disk, record.key, file, putOptions(record))
-          updated = await baseStore.update(record.tenantId, record.id, ['uploading'], {
-            status: 'pending',
-            size: file.size,
-            sha256: file.sha256,
-            scanStatus,
-            ...(inspected.width === undefined ? {} : { width: inspected.width }),
-            ...(inspected.height === undefined ? {} : { height: inspected.height }),
-            updatedAt: nowIso(),
+      const found = await confirmable(input.tenantId, input.fileId)
+      if ('done' in found) return found.done // idempotent
+      return finalizeUploaded(found, ensureResolved(input.rules), input.path ?? [], input.signal)
+    },
+
+    async createResumableUpload(input) {
+      const disk = diskFor(input.disk)
+      if (!isResumable(disk))
+        throw new TypeError(`Disk "${disk.name}" does not support resumable uploads`)
+      if (!Number.isSafeInteger(input.size) || input.size < 1)
+        throw new RangeError('size must be a whole number of bytes, at least 1')
+      const partSize = choosePartSize(disk, input.size)
+      const record = await planDirectUpload(input, disk, async (draft) => ({
+        id: await disk.createMultipartUpload(draft.key, {
+          contentType: draft.contentType,
+          visibility: draft.visibility,
+          originalName: draft.originalName,
+        }),
+        partSize,
+      }))
+      return { fileId: record.id, partSize, partCount: partCountOf(record.size, partSize) }
+    },
+
+    async presignResumableParts(input) {
+      const { record, session, disk } = await resumableRecord(input.tenantId, input.fileId)
+      const count = partCountOf(record.size, session.partSize)
+      const numbers = [...new Set(input.partNumbers)]
+      if (numbers.length === 0 || numbers.length > partsPerRequest)
+        throw new RangeError(`partNumbers must list 1 to ${partsPerRequest} parts`)
+      for (const n of numbers)
+        if (!Number.isSafeInteger(n) || n < 1 || n > count)
+          throw new RangeError(`part ${String(n)} is not in this upload (1 to ${count})`)
+      return Promise.all(
+        numbers.map(async (partNumber) => {
+          const size = partBytes(record.size, session.partSize, partNumber)
+          const upload = await disk.presignUploadPart(record.key, session.id, partNumber, {
+            contentLength: size,
+            ...(input.expiresInSeconds === undefined
+              ? {}
+              : { expiresInSeconds: input.expiresInSeconds }),
           })
-        } catch (error) {
-          // Storage down: the upload stays `uploading`, so the client can confirm again.
-          if (delta > 0) await releaseBytes(record.tenantId, delta)
-          throw error
-        }
-        if (!updated) {
-          if (delta > 0) await releaseBytes(record.tenantId, delta)
-          throw new NotFoundError('file') // cleaned up while we were confirming
-        }
-        if (delta < 0) await releaseBytes(record.tenantId, -delta)
-        await emit('files.stored', updated)
-        return updated
-      } finally {
-        await spooled.dispose()
+          return { partNumber, size, upload }
+        }),
+      )
+    },
+
+    async resumableUploadStatus(tenantId, fileId) {
+      const { record, session, disk } = await resumableRecord(tenantId, fileId)
+      const { good, missing } = checkParts(
+        record,
+        session,
+        await disk.listUploadedParts(record.key, session.id),
+      )
+      return {
+        fileId: record.id,
+        partSize: session.partSize,
+        partCount: partCountOf(record.size, session.partSize),
+        uploadedParts: good.map((part) => part.partNumber),
+        missingParts: missing,
       }
+    },
+
+    async completeResumableUpload(input) {
+      const found = await confirmable(input.tenantId, input.fileId)
+      if ('done' in found) return found.done // idempotent
+      const disk = options.disks[found.disk]
+      if (!found.upload || !disk || !isResumable(disk)) throw new NotFoundError('file')
+      // A retried completion (say the scanner was down the first time) finds the object already
+      // assembled: skip straight to the checks.
+      const existing = await disk.stat(found.key)
+      if (existing?.size !== found.size) {
+        const { good, missing } = checkParts(
+          found,
+          found.upload,
+          await disk.listUploadedParts(found.key, found.upload.id),
+        )
+        if (missing.length > 0) throw new UploadIncompleteError()
+        await disk.completeMultipartUpload(found.key, found.upload.id, good, {
+          contentType: found.contentType,
+          visibility: found.visibility,
+          originalName: found.originalName,
+        })
+      }
+      return finalizeUploaded(found, ensureResolved(input.rules), input.path ?? [], input.signal)
+    },
+
+    async abortResumableUpload(tenantId, fileId) {
+      const { record } = await resumableRecord(tenantId, fileId)
+      // Claim the row first, so a completion racing with us either wins or finds nothing.
+      const claimed = await baseStore.update(tenantId, fileId, ['uploading'], {
+        status: 'deleted',
+        deletedAt: nowIso(),
+        updatedAt: EXPIRED,
+      })
+      if (!claimed) throw new NotFoundError('file')
+      await rollback(record, () => releaseBytes(record.tenantId, record.ownerId, record.size))
     },
 
     async scanStored(tenantId, fileId) {
@@ -787,6 +1140,8 @@ export function createFileManager(options: FileManagerOptions): FileManager {
               updatedAt: EXPIRED,
             })
             if (!claimed) continue
+            // An abandoned resumable upload: its parts are invisible but billed until aborted.
+            if (status === 'uploading') await abortParts(row)
           } else if ((await baseStore.attachmentCount(row.tenantId, row.id)) > 0) continue
           try {
             await diskFor(row.disk).delete(row.key)
@@ -800,7 +1155,7 @@ export function createFileManager(options: FileManagerOptions): FileManager {
           }
           if (await baseStore.remove(row.tenantId, row.id)) {
             removed++
-            await releaseBytes(row.tenantId, row.size)
+            await releaseBytes(row.tenantId, row.ownerId, row.size)
             await emit('files.purged', row)
           }
         }

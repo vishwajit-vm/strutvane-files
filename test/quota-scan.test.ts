@@ -18,6 +18,7 @@ describe('quotas', () => {
       used: 60,
       requested: 50,
       available: 40,
+      scope: 'tenant',
     })
     await quota.reserve('big', 500) // other tenants are independent
     await release()

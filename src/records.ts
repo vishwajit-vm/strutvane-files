@@ -62,6 +62,25 @@ export interface FileRecord {
   readonly updatedAt: string
   /** When the file was marked `deleted` (start of the retention period). */
   readonly deletedAt?: string
+  /**
+   * Who uploaded the file (a user id), for per-user quotas. Absent for files stored without an
+   * owner (system jobs, imports).
+   */
+  readonly ownerId?: string
+  /**
+   * The provider-side multipart session of a resumable upload while it is `uploading`: the
+   * provider's upload id and the part size the client must use. Kept after completion (harmless)
+   * so a retried completion can still find the session.
+   */
+  readonly upload?: ResumableSession
+}
+
+/** A resumable upload's provider-side session (see {@link FileRecord.upload}). */
+export interface ResumableSession {
+  /** The provider's multipart upload id (S3 `UploadId`, or the block-id prefix on Azure). */
+  readonly id: string
+  /** Bytes per part; every part except the last has exactly this size. */
+  readonly partSize: number
 }
 
 /** Fields that may change after insert. */

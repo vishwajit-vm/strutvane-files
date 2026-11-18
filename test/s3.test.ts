@@ -188,7 +188,7 @@ describe('S3Disk (in-process fake S3 behind the real SDK client)', () => {
     await expect(s3.temporaryUrl('a.pdf', { expiresInSeconds: 0 })).rejects.toThrow(RangeError)
   })
 
-  test('presigned uploads sign Content-Type and Content-Length (no "small presign, huge upload")', async () => {
+  test('presigned uploads sign Content-Type, Content-Length and If-None-Match (no "small presign, huge upload", no overwrite)', async () => {
     const { s3 } = disk()
     const target = await s3.presignUpload('tenants/t1/u.pdf', {
       contentType: 'application/pdf',
@@ -199,11 +199,15 @@ describe('S3Disk (in-process fake S3 behind the real SDK client)', () => {
     const url = new URL(target.url)
     expect(target.method).toBe('PUT')
     expect(url.searchParams.get('X-Amz-SignedHeaders')?.split(';')).toEqual(
-      expect.arrayContaining(['content-length', 'content-type', 'host']),
+      expect.arrayContaining(['content-length', 'content-type', 'host', 'if-none-match']),
     )
     expect(url.searchParams.get('X-Amz-Expires')).toBe('300')
     expect(url.searchParams.get('x-amz-meta-sv_visibility')).toBe('public')
-    expect(target.headers).toEqual({ 'content-type': 'application/pdf', 'content-length': '1234' })
+    expect(target.headers).toEqual({
+      'content-type': 'application/pdf',
+      'content-length': '1234',
+      'if-none-match': '*',
+    })
     expect(target.expiresAt).toBe('2026-11-14T12:05:00.000Z')
     await expect(s3.presignUpload('a', { contentType: 'x/y', contentLength: -1 })).rejects.toThrow(
       RangeError,
@@ -238,5 +242,111 @@ describe('S3Disk (in-process fake S3 behind the real SDK client)', () => {
       new URL(await files.temporaryUrl('t1', record.id)).searchParams.get('X-Amz-Expires'),
     ).toBe('300')
     await expect(files.temporaryUrl('t2', record.id)).rejects.toBeInstanceOf(NotFoundError)
+  })
+
+  test('resumable: multipart session, signed part URLs, listing, completion, abort', async () => {
+    const { fake, s3 } = disk({ root: 'app' })
+    const key = 'tenants/t1/big.pdf'
+    const id = await s3.createMultipartUpload(key, {
+      contentType: 'application/pdf',
+      visibility: 'private',
+      originalName: 'big.pdf',
+    })
+    const target = await s3.presignUploadPart(key, id, 1, {
+      contentLength: 5,
+      expiresInSeconds: 60,
+    })
+    const url = new URL(target.url)
+    expect(url.pathname).toContain('/app/tenants/t1/big.pdf')
+    expect(url.searchParams.get('uploadId')).toBe(id)
+    expect(url.searchParams.get('partNumber')).toBe('1')
+    expect(url.searchParams.get('X-Amz-Expires')).toBe('60')
+    expect(url.searchParams.get('X-Amz-SignedHeaders')?.split(';')).toContain('content-length')
+    expect(target.headers).toEqual({ 'content-length': '5' })
+    fake.putPart(id, 2, Buffer.from('-1.7'))
+    fake.putPart(id, 1, Buffer.from('%PDF-'))
+    const parts = await s3.listUploadedParts(key, id)
+    expect(parts).toEqual([
+      { partNumber: 1, size: 5, etag: '"etag-1"' },
+      { partNumber: 2, size: 4, etag: '"etag-2"' },
+    ])
+    await s3.completeMultipartUpload(key, id, parts, { contentType: 'application/pdf' })
+    expect(await readAll(await s3.get(key))).toEqual(new TextEncoder().encode('%PDF--1.7'))
+    // A finished session lists as empty and aborts as a no-op.
+    expect(await s3.listUploadedParts(key, id)).toEqual([])
+    await s3.abortMultipartUpload(key, id)
+    await s3.abortMultipartUpload(key, 'never-existed')
+  })
+
+  test('resumable: listing pages through truncated results (bounded)', async () => {
+    let page = 0
+    // A misbehaving server that says "truncated" forever.
+    const client = {
+      send: async () => {
+        page++
+        return {
+          Parts: [{ PartNumber: page, Size: 1, ETag: `"e${page}"` }],
+          IsTruncated: true,
+          NextPartNumberMarker: String(page),
+        }
+      },
+    } as unknown as ConstructorParameters<typeof S3Disk>[0]['client']
+    const s3 = new S3Disk({ bucket: 'b', client, retry: fastRetry })
+    const parts = await s3.listUploadedParts('a', 'u')
+    expect(page).toBe(11)
+    expect(parts).toHaveLength(11)
+  })
+
+  test('resumable: hostile part numbers and sizes are refused; real errors still surface', async () => {
+    const { fake, s3 } = disk()
+    for (const n of [0, -1, 1.5, 10_001])
+      await expect(s3.presignUploadPart('a', 'u', n, { contentLength: 1 })).rejects.toBeInstanceOf(
+        RangeError,
+      )
+    for (const size of [0, -1, 5 * 1024 ** 3 + 1])
+      await expect(
+        s3.presignUploadPart('a', 'u', 1, { contentLength: size }),
+      ).rejects.toBeInstanceOf(RangeError)
+    await expect(s3.presignUploadPart('../a', 'u', 1, { contentLength: 1 })).rejects.toBeInstanceOf(
+      UnsafeKeyError,
+    )
+    await expect(
+      s3.completeMultipartUpload('a', 'u', [], { contentType: 'x/y' }),
+    ).rejects.toBeInstanceOf(RangeError)
+    fake.fail('AbortMultipartUploadCommand', s3Error('AccessDenied', 403))
+    await expect(s3.abortMultipartUpload('a', 'u')).rejects.toThrow('AccessDenied')
+    fake.fail('ListPartsCommand', s3Error('AccessDenied', 403))
+    await expect(s3.listUploadedParts('a', 'u')).rejects.toThrow('AccessDenied')
+  })
+
+  test('a presigned PUT cannot overwrite an object that already exists (conditional write)', async () => {
+    const { fake, s3 } = disk()
+    await s3.put('tenants/t1/a.pdf', PDF, { contentType: 'application/pdf' })
+    const { PutObjectCommand } = await import('@aws-sdk/client-s3')
+    // What the browser's second PUT with the same URL becomes: S3 answers 412.
+    await expect(
+      fake.client.send(
+        new PutObjectCommand({
+          Bucket: 'uploads',
+          Key: 'tenants/t1/a.pdf',
+          Body: 'evil',
+          IfNoneMatch: '*',
+        }),
+      ),
+    ).rejects.toThrow('PreconditionFailed')
+    const target = await s3.presignUpload('tenants/t1/b.pdf', {
+      contentType: 'application/pdf',
+      contentLength: 3,
+    })
+    expect(target.headers['if-none-match']).toBe('*')
+    const off = disk({ conditionalWrites: false }).s3
+    const plain = await off.presignUpload('tenants/t1/b.pdf', {
+      contentType: 'application/pdf',
+      contentLength: 3,
+    })
+    expect(plain.headers['if-none-match']).toBeUndefined()
+    expect(new URL(plain.url).searchParams.get('X-Amz-SignedHeaders')).not.toContain(
+      'if-none-match',
+    )
   })
 })

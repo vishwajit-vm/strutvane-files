@@ -42,6 +42,8 @@ function fakeContainer(credential: StorageSharedKeyCredential | TokenCredential)
     credential as StorageSharedKeyCredential,
   )
   const blobs = new Map<string, FakeBlob>()
+  /** Uncommitted blocks per blob name (what Put Block with a part URL leaves behind). */
+  const blocks = new Map<string, Map<string, Buffer>>()
   const failures: unknown[] = []
   const takeFailure = () => {
     const f = failures.shift()
@@ -90,6 +92,41 @@ function fakeContainer(credential: StorageSharedKeyCredential | TokenCredential)
           takeFailure()
           return { succeeded: blobs.delete(name) }
         },
+        async getBlockList(kind: string) {
+          takeFailure()
+          expect(kind).toBe('uncommitted')
+          const staged = blocks.get(name)
+          if (!staged && !blobs.has(name)) throw restError(404, 'BlobNotFound')
+          return {
+            uncommittedBlocks: [...(staged ?? new Map()).entries()].map(([id, body]) => ({
+              name: id,
+              size: body.length,
+            })),
+          }
+        },
+        async commitBlockList(
+          ids: string[],
+          options: {
+            blobHTTPHeaders?: { blobContentType?: string }
+            metadata?: Record<string, string>
+          },
+        ) {
+          takeFailure()
+          const staged = blocks.get(name) ?? new Map<string, Buffer>()
+          const parts = ids.map((id) => {
+            const body = staged.get(id)
+            if (!body) throw restError(400, 'InvalidBlockList')
+            return body
+          })
+          blobs.set(name, {
+            body: Buffer.concat(parts),
+            contentType: options.blobHTTPHeaders?.blobContentType,
+            metadata: { ...options.metadata },
+            lastModified: NOW,
+          })
+          blocks.delete(name) // committing discards every other uncommitted block
+          return {}
+        },
       })
     },
   })
@@ -123,7 +160,13 @@ function fakeContainer(credential: StorageSharedKeyCredential | TokenCredential)
       },
     }),
   })
-  return { container, blobs, failures }
+  /** What the browser's part PUT does. */
+  const stageBlock = (name: string, blockId: string, body: Buffer) => {
+    const staged = blocks.get(name) ?? new Map<string, Buffer>()
+    staged.set(blockId, body)
+    blocks.set(name, staged)
+  }
+  return { container, blobs, blocks, failures, stageBlock }
 }
 
 const fastRetry = { sleep: async () => {}, attempts: 3 }
@@ -237,7 +280,7 @@ describe('AzureBlobDisk (in-memory blobs behind the real SDK client)', () => {
     expect(new URL(await local.temporaryUrl('a.pdf')).searchParams.get('spr')).toBe('https,http')
   })
 
-  test('presigned uploads: create+write only, required headers, metadata as headers', async () => {
+  test('presigned uploads: create only (no overwrite), required headers, metadata as headers', async () => {
     const { disk } = sharedKeyDisk()
     const target = await disk.presignUpload('tenants/t1/u.pdf', {
       contentType: 'application/pdf',
@@ -245,7 +288,7 @@ describe('AzureBlobDisk (in-memory blobs behind the real SDK client)', () => {
       originalName: 'u.pdf',
     })
     const url = new URL(target.url)
-    expect(url.searchParams.get('sp')).toBe('cw')
+    expect(url.searchParams.get('sp')).toBe('c')
     expect(target.headers).toMatchObject({
       'x-ms-blob-type': 'BlockBlob',
       'content-type': 'application/pdf',
@@ -325,5 +368,76 @@ describe('AzureBlobDisk (in-memory blobs behind the real SDK client)', () => {
     await expect(
       createAzureBlobDisk({ containerName: 'f', auth: { accountKey: KEY } }),
     ).rejects.toThrow(/account/)
+  })
+
+  test('resumable uploads: create-only block SAS per part, size-checked listing, commit', async () => {
+    const { disk, blobs, stageBlock } = sharedKeyDisk({ root: 'app' })
+    const key = 'tenants/t1/big.pdf'
+    const uploadId = await disk.createMultipartUpload(key, { contentType: 'application/pdf' })
+    expect(uploadId).toMatch(/^[0-9a-f]{24}$/)
+    expect(await disk.listUploadedParts(key, uploadId)).toEqual([]) // nothing staged yet
+    const target = await disk.presignUploadPart(key, uploadId, 2, { contentLength: 3 })
+    const url = new URL(target.url)
+    expect(url.pathname).toBe('/files/app/tenants/t1/big.pdf')
+    expect(url.searchParams.get('sp')).toBe('c') // cannot overwrite a committed blob
+    expect(url.searchParams.get('comp')).toBe('block')
+    expect(url.searchParams.get('spr')).toBe('https')
+    const blockId = url.searchParams.get('blockid') ?? ''
+    expect(Buffer.from(blockId, 'base64').toString()).toBe(`${uploadId}-000002`)
+    expect(target.headers).toEqual({ 'content-length': '3' })
+
+    const first = (await disk.presignUploadPart(key, uploadId, 1, { contentLength: 4 })).url
+    stageBlock(`app/${key}`, new URL(first).searchParams.get('blockid') ?? '', Buffer.from('%PDF'))
+    stageBlock(`app/${key}`, blockId, Buffer.from('-1.'))
+    // A block from another session for the same blob is ignored, never committed.
+    stageBlock(
+      `app/${key}`,
+      Buffer.from(`${'f'.repeat(24)}-000001`).toString('base64'),
+      Buffer.from('evil'),
+    )
+    stageBlock(`app/${key}`, Buffer.from('not-ours').toString('base64'), Buffer.from('x'))
+    const parts = await disk.listUploadedParts(key, uploadId)
+    expect(parts.map((p) => [p.partNumber, p.size])).toEqual([
+      [1, 4],
+      [2, 3],
+    ])
+    await disk.completeMultipartUpload(key, uploadId, parts, {
+      contentType: 'application/pdf',
+      visibility: 'public',
+      originalName: 'big.pdf',
+    })
+    expect(blobs.get(`app/${key}`)?.body.toString()).toBe('%PDF-1.')
+    expect(await disk.stat(key)).toMatchObject({
+      size: 7,
+      contentType: 'application/pdf',
+      visibility: 'public',
+    })
+    await disk.abortMultipartUpload(key, uploadId) // a no-op on Azure, but must not throw
+  })
+
+  test('resumable uploads: hostile ids and part numbers are refused before any request', async () => {
+    const { disk } = sharedKeyDisk()
+    const key = 'tenants/t1/big.pdf'
+    for (const id of ['', 'ABC', '../x', 'f'.repeat(25)]) {
+      await expect(disk.listUploadedParts(key, id)).rejects.toBeInstanceOf(RangeError)
+      await expect(disk.presignUploadPart(key, id, 1, { contentLength: 1 })).rejects.toBeInstanceOf(
+        RangeError,
+      )
+    }
+    const id = await disk.createMultipartUpload(key, { contentType: 'application/pdf' })
+    for (const n of [0, -1, 1.5, 50_001])
+      await expect(disk.presignUploadPart(key, id, n, { contentLength: 1 })).rejects.toBeInstanceOf(
+        RangeError,
+      )
+    for (const size of [0, 4000 * 1024 * 1024 + 1])
+      await expect(
+        disk.presignUploadPart(key, id, 1, { contentLength: size }),
+      ).rejects.toBeInstanceOf(RangeError)
+    await expect(
+      disk.completeMultipartUpload(key, id, [], { contentType: 'x/y' }),
+    ).rejects.toBeInstanceOf(RangeError)
+    await expect(disk.createMultipartUpload('../x', { contentType: 'x/y' })).rejects.toBeInstanceOf(
+      UnsafeKeyError,
+    )
   })
 })

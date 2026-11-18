@@ -254,7 +254,13 @@ describe('errors and messages', () => {
     ])
     expect(infected.params).toEqual({}) // the signature is not sent to the client
     const quota = new QuotaExceededError({ limit: 100, used: 90, requested: 20 })
-    expect(quota.params).toEqual({ limit: 100, used: 90, requested: 20, available: 10 })
+    expect(quota.params).toEqual({
+      limit: 100,
+      used: 90,
+      requested: 20,
+      available: 10,
+      scope: 'tenant',
+    })
     expect(new UploadIncompleteError().status).toBe(400)
     expect(new FileRejectedError('file_too_large', { max: '1 KB' }).status).toBe(422)
     expect(new FileRejectedError('file_empty').params).toEqual({})

@@ -12,6 +12,7 @@ import {
   GetObjectCommand,
   HeadObjectCommand,
   ListObjectsV2Command,
+  ListPartsCommand,
   PutObjectCommand,
   S3Client,
   UploadPartCommand,
@@ -44,7 +45,16 @@ export interface FakeS3 {
   calls: string[]
   /** Queue failures for the next calls of a command name, e.g. `fail('PutObjectCommand', err)`. */
   fail(command: string, ...errors: unknown[]): void
-  multipart: Map<string, { key: string; parts: Map<number, Buffer>; aborted: boolean }>
+  multipart: Map<string, MultipartState>
+  /** What a browser does with a presigned part URL: store a part (S3 checks the signed size). */
+  putPart(uploadId: string, partNumber: number, body: Buffer): void
+}
+
+export interface MultipartState {
+  key: string
+  parts: Map<number, Buffer>
+  aborted: boolean
+  completed?: boolean
 }
 
 export function createFakeS3(): FakeS3 {
@@ -59,7 +69,12 @@ export function createFakeS3(): FakeS3 {
   const objects = new Map<string, FakeObject>()
   const calls: string[] = []
   const failures = new Map<string, unknown[]>()
-  const multipart = new Map<string, { key: string; parts: Map<number, Buffer>; aborted: boolean }>()
+  const multipart = new Map<string, MultipartState>()
+  const live = (id: string): MultipartState => {
+    const m = multipart.get(id)
+    if (!m || m.aborted || m.completed) throw s3Error('NoSuchUpload', 404)
+    return m
+  }
   let uploads = 0
 
   const handle = async (command: unknown): Promise<unknown> => {
@@ -73,6 +88,7 @@ export function createFakeS3(): FakeS3 {
       const body = await bodyBytes(input['Body'])
       if (input['ContentLength'] !== undefined && input['ContentLength'] !== body.length)
         throw s3Error('IncompleteBody', 400)
+      if (input['IfNoneMatch'] === '*' && objects.has(key)) throw s3Error('PreconditionFailed', 412)
       const checksum = input['ChecksumSHA256']
       if (checksum && createHash('sha256').update(body).digest('base64') !== checksum)
         throw s3Error('BadDigest', 400)
@@ -132,18 +148,30 @@ export function createFakeS3(): FakeS3 {
       return { UploadId: id }
     }
     if (command instanceof UploadPartCommand) {
-      const m = multipart.get(String(input['UploadId']))
-      if (!m) throw s3Error('NoSuchUpload', 404)
+      const m = live(String(input['UploadId']))
       const body = await bodyBytes(input['Body'])
       if (body.length !== input['ContentLength']) throw s3Error('IncompleteBody', 400)
       m.parts.set(Number(input['PartNumber']), body)
       return { ETag: `"etag-${input['PartNumber']}"` }
     }
+    if (command instanceof ListPartsCommand) {
+      const m = live(String(input['UploadId']))
+      return {
+        Parts: [...m.parts.entries()]
+          .sort(([a], [b]) => a - b)
+          .map(([n, body]) => ({ PartNumber: n, Size: body.length, ETag: `"etag-${n}"` })),
+        IsTruncated: false,
+      }
+    }
     if (command instanceof CompleteMultipartUploadCommand) {
       const id = String(input['UploadId'])
-      const m = multipart.get(id)
-      if (!m) throw s3Error('NoSuchUpload', 404)
-      const parts = (input['MultipartUpload'] as { Parts: { PartNumber: number }[] }).Parts
+      const m = live(id)
+      const parts = (input['MultipartUpload'] as { Parts: { PartNumber: number; ETag: string }[] })
+        .Parts
+      for (const part of parts)
+        if (!m.parts.has(part.PartNumber) || part.ETag !== `"etag-${part.PartNumber}"`)
+          throw s3Error('InvalidPart', 400)
+      m.completed = true
       const pending = objects.get(`__pending__/${id}`)
       objects.delete(`__pending__/${id}`)
       objects.set(m.key, {
@@ -171,6 +199,9 @@ export function createFakeS3(): FakeS3 {
     objects,
     calls,
     multipart,
+    putPart(uploadId, partNumber, body) {
+      live(uploadId).parts.set(partNumber, body)
+    },
     fail(command, ...errors) {
       failures.set(command, [...(failures.get(command) ?? []), ...errors])
     },

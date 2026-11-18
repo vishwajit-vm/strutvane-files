@@ -21,11 +21,15 @@ export {
   type FilesPutOptions,
   type FilesTemporaryUrlOptions,
   isPresigning,
+  isResumable,
   isSpoolAware,
+  type MultipartObjectOptions,
   type PresigningDisk,
   type PresignUploadOptions,
   putSpooled,
+  type ResumableDisk,
   type SpoolAwareDisk,
+  type UploadedPart,
 } from './disk.ts'
 export {
   FILE_ISSUE_CODES,
@@ -92,6 +96,11 @@ export {
   type FileEventType,
   type FileManager,
   type FileManagerOptions,
+  type PresignedPart,
+  type PresignPartsInput,
+  type ResumableOptions,
+  type ResumableStatus,
+  type ResumableUpload,
   type StoreInput,
 } from './manager.ts'
 export { FILES_MESSAGES_EN } from './messages.ts'
@@ -106,9 +115,16 @@ export {
   SNIFF_BYTES,
 } from './mime.ts'
 export {
+  assertOwnerId,
+  createOwnerQuotaGuard,
   createQuotaGuard,
   GLOBAL_QUOTA_KEY,
+  MAX_OWNER_ID_LENGTH,
+  MemoryOwnerQuotaCounter,
   MemoryQuotaCounter,
+  type OwnerQuotaCounter,
+  type OwnerQuotaGuard,
+  type OwnerQuotaOptions,
   type QuotaCounter,
   type QuotaGuard,
   type QuotaOptions,
@@ -122,6 +138,7 @@ export {
   type FileRecordStore,
   type FileStatus,
   MemoryFileStore,
+  type ResumableSession,
   type StaleQuery,
 } from './records.ts'
 export {

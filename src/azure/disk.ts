@@ -10,11 +10,18 @@
  * - **Private by default.** Containers should not allow anonymous access. `url()` only answers
  *   for `public` files and uses `publicUrl` (a CDN) when set. Private files are reached through
  *   short-lived SAS URLs (default 5 minutes, at most `maxExpirySeconds`, HTTPS only, read only).
+ * - **Uploads can't overwrite.** Upload SAS URLs carry only the *create* permission, so once
+ *   the server has verified and scanned a blob, a client still holding the URL cannot replace it.
+ * - **Resumable direct uploads** use block blobs: each part is a `Put Block` with its own SAS
+ *   URL, and the server commits the block list itself after checking every block's size (a SAS
+ *   cannot pin a size). Uncommitted blocks of an abandoned upload are discarded by Azure after
+ *   7 days; there is no API to delete them earlier.
  * - **Failures:** throttling (503 ServerBusy), 5xx and network errors are retried with backoff +
  *   jitter, then surface as `STORAGE_UNAVAILABLE` (503). Missing blobs are `NotFoundError` (404).
  *
  * @module
  */
+import { randomBytes } from 'node:crypto'
 import { Readable } from 'node:stream'
 import {
   BlobSASPermissions,
@@ -31,9 +38,12 @@ import {
   type DirectUploadTarget,
   type FilesPutOptions,
   type FilesTemporaryUrlOptions,
+  type MultipartObjectOptions,
   type PresigningDisk,
   type PresignUploadOptions,
+  type ResumableDisk,
   type SpoolAwareDisk,
+  type UploadedPart,
 } from '../disk.ts'
 import { assertSafeKey, assertSafePrefix } from '../keys.ts'
 import { type RetryOptions, statusOf, withRetry } from '../retry.ts'
@@ -68,6 +78,11 @@ export interface AzureBlobDiskOptions {
   readonly now?: () => Date
 }
 
+const MiB = 1024 * 1024
+
+/** A resumable upload id: 24 lowercase hex characters (it prefixes every block id). */
+const UPLOAD_ID = /^[0-9a-f]{24}$/
+
 /** Clock-skew allowance: a SAS starts slightly in the past so it works on a fast client clock. */
 const SKEW_MS = 5 * 60_000
 
@@ -77,8 +92,14 @@ function isNotFound(error: unknown): boolean {
 }
 
 /** An Azure Blob disk. See the module docs. */
-export class AzureBlobDisk implements SpoolAwareDisk, PresigningDisk {
+export class AzureBlobDisk implements SpoolAwareDisk, PresigningDisk, ResumableDisk {
   readonly name: string
+  /** Azure has no minimum block size; 1 byte keeps the contract honest. */
+  readonly minPartSize: number = 1
+  /** Azure's largest block (4000 MiB). */
+  readonly maxPartSize: number = 4000 * MiB
+  /** Azure's block limit per blob. */
+  readonly maxParts: number = 50_000
   readonly #container: ContainerClient
   readonly #root: string
   readonly #options: AzureBlobDiskOptions
@@ -276,9 +297,10 @@ export class AzureBlobDisk implements SpoolAwareDisk, PresigningDisk {
     if (!Number.isSafeInteger(options.contentLength) || options.contentLength < 0)
       throw new RangeError('contentLength must be a whole number of bytes')
     const expiresIn = clampExpiry(options.expiresInSeconds, this.#options.maxExpirySeconds ?? 3600)
-    // Create + write only: the URL cannot read, list or delete anything. Azure SAS cannot pin
-    // the size or type, so the confirm step verifies both and deletes mismatches.
-    const url = await this.#sign(blob, BlobSASPermissions.parse('cw'), expiresIn, {})
+    // Create only: the URL cannot read, list, delete, or overwrite a blob that already exists
+    // (so not the verified file either). Azure SAS cannot pin the size or type, so the confirm
+    // step verifies both and deletes mismatches.
+    const url = await this.#sign(blob, BlobSASPermissions.parse('c'), expiresIn, {})
     const metadata = encodeMetadata({
       visibility: options.visibility ?? 'private',
       createdAt: this.#now().toISOString(),
@@ -332,5 +354,104 @@ export class AzureBlobDisk implements SpoolAwareDisk, PresigningDisk {
     )
     this.#delegationKey = { key, expires }
     return key
+  }
+
+  /** The block id of one part: same length for every part, as Azure requires. */
+  #blockId(uploadId: string, partNumber: number): string {
+    return Buffer.from(`${uploadId}-${String(partNumber).padStart(6, '0')}`).toString('base64')
+  }
+
+  #assertUpload(uploadId: string, partNumber?: number): void {
+    if (!UPLOAD_ID.test(uploadId)) throw new RangeError('invalid resumable upload id')
+    if (
+      partNumber !== undefined &&
+      (!Number.isSafeInteger(partNumber) || partNumber < 1 || partNumber > this.maxParts)
+    )
+      throw new RangeError(`partNumber must be a whole number from 1 to ${this.maxParts}`)
+  }
+
+  async createMultipartUpload(key: string, _options: MultipartObjectOptions): Promise<string> {
+    this.#key(key)
+    // Nothing exists on Azure until the first block arrives: the id only namespaces block ids,
+    // so two sessions for the same key can never mix their blocks.
+    return randomBytes(12).toString('hex')
+  }
+
+  async presignUploadPart(
+    key: string,
+    uploadId: string,
+    partNumber: number,
+    options: { readonly contentLength: number; readonly expiresInSeconds?: number },
+  ): Promise<DirectUploadTarget> {
+    const blob = this.#container.getBlockBlobClient(this.#key(key))
+    this.#assertUpload(uploadId, partNumber)
+    if (
+      !Number.isSafeInteger(options.contentLength) ||
+      options.contentLength < 1 ||
+      options.contentLength > this.maxPartSize
+    )
+      throw new RangeError(`contentLength must be 1 to ${this.maxPartSize} bytes`)
+    const expiresIn = clampExpiry(options.expiresInSeconds, this.#options.maxExpirySeconds ?? 3600)
+    const sas = await this.#sign(blob, BlobSASPermissions.parse('c'), expiresIn, {})
+    const blockId = encodeURIComponent(this.#blockId(uploadId, partNumber))
+    return {
+      url: `${sas}&comp=block&blockid=${blockId}`,
+      method: 'PUT',
+      // Not signed (a SAS can't pin it); completeMultipartUpload's caller checks every size.
+      headers: { 'content-length': String(options.contentLength) },
+      expiresAt: new Date(this.#now().getTime() + expiresIn * 1000).toISOString(),
+    }
+  }
+
+  async listUploadedParts(key: string, uploadId: string): Promise<readonly UploadedPart[]> {
+    const blob = this.#container.getBlockBlobClient(this.#key(key))
+    this.#assertUpload(uploadId)
+    let blocks: readonly { readonly name: string; readonly size: number }[]
+    try {
+      const list = await this.#retry(() => blob.getBlockList('uncommitted'))
+      blocks = list.uncommittedBlocks ?? []
+    } catch (error) {
+      if (isNotFound(error)) return [] // no block has arrived yet
+      throw error
+    }
+    const parts: UploadedPart[] = []
+    for (const block of blocks) {
+      const decoded = Buffer.from(block.name, 'base64').toString('utf8')
+      const match = /^([0-9a-f]{24})-([0-9]{6})$/.exec(decoded)
+      if (!match || match[1] !== uploadId) continue // another session's (or a foreign) block
+      parts.push({ partNumber: Number(match[2]), size: block.size, etag: block.name })
+    }
+    return parts.sort((a, b) => a.partNumber - b.partNumber)
+  }
+
+  async completeMultipartUpload(
+    key: string,
+    uploadId: string,
+    parts: readonly UploadedPart[],
+    options: MultipartObjectOptions,
+  ): Promise<void> {
+    const blob = this.#container.getBlockBlobClient(this.#key(key))
+    this.#assertUpload(uploadId)
+    if (parts.length === 0) throw new RangeError('completeMultipartUpload needs at least one part')
+    const ordered = [...parts].sort((a, b) => a.partNumber - b.partNumber)
+    await this.#retry(() =>
+      blob.commitBlockList(
+        ordered.map((p) => this.#blockId(uploadId, p.partNumber)),
+        {
+          blobHTTPHeaders: { blobContentType: options.contentType },
+          metadata: encodeMetadata({
+            visibility: options.visibility ?? 'private',
+            createdAt: this.#now().toISOString(),
+            ...(options.originalName === undefined ? {} : { originalName: options.originalName }),
+          }),
+        },
+      ),
+    )
+  }
+
+  async abortMultipartUpload(_key: string, uploadId: string): Promise<void> {
+    // Azure has no call that deletes uncommitted blocks; it discards them after 7 days, and a
+    // blob is never created from them unless the server commits the list. Nothing to do.
+    this.#assertUpload(uploadId)
   }
 }

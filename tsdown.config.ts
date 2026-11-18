@@ -21,11 +21,6 @@ export default defineConfig({
   sourcemap: true,
   clean: true,
   deps: {
-    neverBundle: [
-      /^@strutvane\/framework(\/.*)?$/,
-      /^@aws-sdk\//,
-      /^@azure\//,
-      'sharp',
-    ],
+    neverBundle: [/^@strutvane\/framework(\/.*)?$/, /^@aws-sdk\//, /^@azure\//, 'sharp'],
   },
 })

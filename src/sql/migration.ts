@@ -74,7 +74,10 @@ export function filesMigration(options: FilesMigrationOptions): Migration {
   height integer NULL,
   created_at ${ts} NOT NULL,
   updated_at ${ts} NOT NULL,
-  deleted_at ${ts} NULL
+  deleted_at ${ts} NULL,
+  owner_id varchar(255) NULL,
+  upload_id varchar(1024) NULL,
+  upload_part_size ${big} NULL CHECK (upload_part_size IS NULL OR upload_part_size > 0)
 )`,
     `CREATE UNIQUE INDEX ${idx('disk_key_uq')} ON ${files} (disk, key)`,
     `CREATE INDEX ${idx('status_updated_idx')} ON ${files} (tenant_id, status, updated_at)`,

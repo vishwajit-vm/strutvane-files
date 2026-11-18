@@ -76,6 +76,12 @@ function toRecord(row: Record<string, unknown>): FileRecord {
     ...(row['deleted_at'] === null || row['deleted_at'] === undefined
       ? {}
       : { deletedAt: iso(row['deleted_at']) }),
+    ...(row['owner_id'] === null || row['owner_id'] === undefined
+      ? {}
+      : { ownerId: String(row['owner_id']) }),
+    ...(row['upload_id'] === null || row['upload_id'] === undefined
+      ? {}
+      : { upload: { id: String(row['upload_id']), partSize: num(row['upload_part_size']) } }),
   }
 }
 
@@ -121,8 +127,8 @@ export class SqlFileStore implements FileRecordStore {
 
   async insert(r: FileRecord): Promise<void> {
     await this.#query(
-      `INSERT INTO ${this.#files} (id, tenant_id, disk, key, size, content_type, sha256, original_name, visibility, status, scan_status, width, height, created_at, updated_at, deleted_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO ${this.#files} (id, tenant_id, disk, key, size, content_type, sha256, original_name, visibility, status, scan_status, width, height, created_at, updated_at, deleted_at, owner_id, upload_id, upload_part_size)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         r.id,
         r.tenantId,
@@ -140,6 +146,9 @@ export class SqlFileStore implements FileRecordStore {
         r.createdAt,
         r.updatedAt,
         r.deletedAt ?? null,
+        r.ownerId ?? null,
+        r.upload?.id ?? null,
+        r.upload?.partSize ?? null,
       ],
     )
   }

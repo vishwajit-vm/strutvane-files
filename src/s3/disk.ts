@@ -9,6 +9,10 @@
  *   that was corrupted in transit. It is also stored as metadata for `stat()`.
  * - **Large files** (above `multipartThreshold`) use multipart upload with per-part retries; a
  *   failed upload is aborted so no invisible parts keep costing money.
+ * - **Resumable direct uploads** use the same S3 multipart protocol from the browser: each part
+ *   gets its own presigned `UploadPart` URL with its exact `Content-Length` signed, so a part can
+ *   never be larger than the server planned, and the server lists the parts S3 actually received
+ *   before it completes the upload (it never trusts client-reported ETags).
  * - **Private by default.** S3 ACLs are deprecated (new buckets enforce "bucket owner"), so
  *   visibility is metadata here: `url()` only answers for `public` files and builds the URL from
  *   `publicUrl` (a CDN or a bucket policy that exposes the public prefix). Private files are
@@ -27,6 +31,8 @@ import {
   HeadObjectCommand,
   type HeadObjectCommandOutput,
   ListObjectsV2Command,
+  ListPartsCommand,
+  type ListPartsCommandOutput,
   PutObjectCommand,
   type S3Client,
   UploadPartCommand,
@@ -39,9 +45,12 @@ import {
   type DirectUploadTarget,
   type FilesPutOptions,
   type FilesTemporaryUrlOptions,
+  type MultipartObjectOptions,
   type PresigningDisk,
   type PresignUploadOptions,
+  type ResumableDisk,
   type SpoolAwareDisk,
+  type UploadedPart,
 } from '../disk.ts'
 import { assertSafeKey, assertSafePrefix } from '../keys.ts'
 import { type RetryOptions, statusOf, withRetry } from '../retry.ts'
@@ -49,6 +58,7 @@ import { type SpooledFile, spool } from '../spool.ts'
 import { decodeMetadata, encodeMetadata, publicObjectUrl } from '../storage-metadata.ts'
 
 const MiB = 1024 * 1024
+const GiB = 1024 * MiB
 
 /** Options for {@link S3Disk}. */
 export interface S3DiskOptions {
@@ -73,6 +83,13 @@ export interface S3DiskOptions {
   readonly kmsKeyId?: string
   /** Send `x-amz-checksum-sha256` on uploads. Default `true`; turn off for stores without it. */
   readonly checksum?: boolean
+  /**
+   * Sign `If-None-Match: *` into presigned single-PUT upload URLs, so S3 refuses a second PUT to
+   * the same key: once the server has verified and scanned an upload, a client still holding the
+   * URL cannot swap the bytes. Default `true`. Turn it off only for an S3-compatible store
+   * without conditional writes (it would then reject every upload with 501).
+   */
+  readonly conditionalWrites?: boolean
   /** Parent directory for temp files. */
   readonly tempDir?: string
   /** Injected for tests. */
@@ -103,9 +120,26 @@ function isNotFound(error: unknown): boolean {
   return name === 'NoSuchKey' || name === 'NotFound' || statusOf(error) === 404
 }
 
+/** A multipart session that no longer exists (completed, aborted or expired). */
+function isNoSuchUpload(error: unknown): boolean {
+  const name = (error as { name?: unknown } | null)?.name
+  return name === 'NoSuchUpload' || statusOf(error) === 404
+}
+
+function assertPartNumber(partNumber: number, max: number): void {
+  if (!Number.isSafeInteger(partNumber) || partNumber < 1 || partNumber > max)
+    throw new RangeError(`partNumber must be a whole number from 1 to ${max}`)
+}
+
 /** An S3 disk. See the module docs. */
-export class S3Disk implements SpoolAwareDisk, PresigningDisk {
+export class S3Disk implements SpoolAwareDisk, PresigningDisk, ResumableDisk {
   readonly name: string
+  /** S3's smallest part (every part except the last). */
+  readonly minPartSize: number = 5 * MiB
+  /** S3's largest part. */
+  readonly maxPartSize: number = 5 * GiB
+  /** S3's part limit per upload. */
+  readonly maxParts: number = 10_000
   readonly bucket: string
   readonly #client: S3Client
   readonly #root: string
@@ -386,6 +420,7 @@ export class S3Disk implements SpoolAwareDisk, PresigningDisk {
     if (!Number.isSafeInteger(options.contentLength) || options.contentLength < 0)
       throw new RangeError('contentLength must be a whole number of bytes')
     const expiresIn = clampExpiry(options.expiresInSeconds, this.#options.maxExpirySeconds ?? 3600)
+    const conditional = this.#options.conditionalWrites !== false
     const url = await getSignedUrl(
       this.#client,
       new PutObjectCommand({
@@ -400,12 +435,17 @@ export class S3Disk implements SpoolAwareDisk, PresigningDisk {
           ...(options.originalName === undefined ? {} : { originalName: options.originalName }),
         }),
         ...this.#encryption(),
+        ...(conditional ? { IfNoneMatch: '*' } : {}),
       }),
       {
         expiresIn,
         // Signed headers: S3 rejects an upload with a different type or size (no "small file
-        // presign, huge upload" bypass).
-        signableHeaders: new Set(['content-type', 'content-length']),
+        // presign, huge upload" bypass), or one that would overwrite an existing object.
+        signableHeaders: new Set([
+          'content-type',
+          'content-length',
+          ...(conditional ? ['if-none-match'] : []),
+        ]),
       },
     )
     return {
@@ -414,8 +454,139 @@ export class S3Disk implements SpoolAwareDisk, PresigningDisk {
       headers: {
         'content-type': options.contentType,
         'content-length': String(options.contentLength),
+        ...(conditional ? { 'if-none-match': '*' } : {}),
       },
       expiresAt: new Date(this.#now().getTime() + expiresIn * 1000).toISOString(),
+    }
+  }
+
+  async createMultipartUpload(key: string, options: MultipartObjectOptions): Promise<string> {
+    const fullKey = this.#key(key)
+    const out = await this.#retry(() =>
+      this.#client.send(
+        new CreateMultipartUploadCommand({
+          Bucket: this.bucket,
+          Key: fullKey,
+          ContentType: options.contentType,
+          Metadata: encodeMetadata({
+            visibility: options.visibility ?? 'private',
+            createdAt: this.#now().toISOString(),
+            ...(options.originalName === undefined ? {} : { originalName: options.originalName }),
+          }),
+          ...this.#encryption(),
+        }),
+      ),
+    )
+    if (!out.UploadId) throw new Error('S3 did not return an UploadId')
+    return out.UploadId
+  }
+
+  async presignUploadPart(
+    key: string,
+    uploadId: string,
+    partNumber: number,
+    options: { readonly contentLength: number; readonly expiresInSeconds?: number },
+  ): Promise<DirectUploadTarget> {
+    const fullKey = this.#key(key)
+    assertPartNumber(partNumber, this.maxParts)
+    if (
+      !Number.isSafeInteger(options.contentLength) ||
+      options.contentLength < 1 ||
+      options.contentLength > this.maxPartSize
+    )
+      throw new RangeError(`contentLength must be 1 to ${this.maxPartSize} bytes`)
+    const expiresIn = clampExpiry(options.expiresInSeconds, this.#options.maxExpirySeconds ?? 3600)
+    const url = await getSignedUrl(
+      this.#client,
+      new UploadPartCommand({
+        Bucket: this.bucket,
+        Key: fullKey,
+        UploadId: uploadId,
+        PartNumber: partNumber,
+        ContentLength: options.contentLength,
+      }),
+      // A signed Content-Length: S3 refuses a part of any other size.
+      { expiresIn, signableHeaders: new Set(['content-length']) },
+    )
+    return {
+      url,
+      method: 'PUT',
+      headers: { 'content-length': String(options.contentLength) },
+      expiresAt: new Date(this.#now().getTime() + expiresIn * 1000).toISOString(),
+    }
+  }
+
+  async listUploadedParts(key: string, uploadId: string): Promise<readonly UploadedPart[]> {
+    const fullKey = this.#key(key)
+    const parts: UploadedPart[] = []
+    let marker: string | undefined
+    // Bounded: 10 000 parts at 1 000 per page is at most 10 pages; a misbehaving server that
+    // keeps saying "truncated" cannot loop us forever.
+    for (let page = 0; page < 11; page++) {
+      let out: ListPartsCommandOutput
+      try {
+        out = await this.#retry(() =>
+          this.#client.send(
+            new ListPartsCommand({
+              Bucket: this.bucket,
+              Key: fullKey,
+              UploadId: uploadId,
+              ...(marker === undefined ? {} : { PartNumberMarker: marker }),
+            }),
+          ),
+        )
+      } catch (error) {
+        if (isNoSuchUpload(error)) return []
+        throw error
+      }
+      for (const part of out.Parts ?? []) {
+        if (part.PartNumber === undefined || part.ETag === undefined) continue
+        parts.push({ partNumber: part.PartNumber, size: part.Size ?? 0, etag: part.ETag })
+      }
+      if (!out.IsTruncated || out.NextPartNumberMarker === undefined) break
+      marker = String(out.NextPartNumberMarker)
+    }
+    return parts.sort((a, b) => a.partNumber - b.partNumber)
+  }
+
+  async completeMultipartUpload(
+    key: string,
+    uploadId: string,
+    parts: readonly UploadedPart[],
+    _options: MultipartObjectOptions,
+  ): Promise<void> {
+    const fullKey = this.#key(key)
+    if (parts.length === 0) throw new RangeError('completeMultipartUpload needs at least one part')
+    const ordered = [...parts].sort((a, b) => a.partNumber - b.partNumber)
+    // Type and metadata were fixed by CreateMultipartUpload; S3 ignores them here.
+    await this.#retry(() =>
+      this.#client.send(
+        new CompleteMultipartUploadCommand({
+          Bucket: this.bucket,
+          Key: fullKey,
+          UploadId: uploadId,
+          MultipartUpload: {
+            Parts: ordered.map((p) => ({ ETag: p.etag, PartNumber: p.partNumber })),
+          },
+        }),
+      ),
+    )
+  }
+
+  async abortMultipartUpload(key: string, uploadId: string): Promise<void> {
+    const fullKey = this.#key(key)
+    try {
+      await this.#retry(() =>
+        this.#client.send(
+          new AbortMultipartUploadCommand({
+            Bucket: this.bucket,
+            Key: fullKey,
+            UploadId: uploadId,
+          }),
+        ),
+      )
+    } catch (error) {
+      if (!isNoSuchUpload(error)) throw error // already gone: nothing to abort
     }
   }
 }
