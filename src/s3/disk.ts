@@ -32,8 +32,8 @@ import {
   UploadPartCommand,
 } from '@aws-sdk/client-s3'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
-import type { FileBody, FileListPage, StoredFile } from '@strutvane/contracts'
-import { NotFoundError } from '@strutvane/core'
+import type { FileBody, FileListPage, StoredFile } from '@strutvane/framework/contracts'
+import { NotFoundError } from '@strutvane/framework/core'
 import {
   clampExpiry,
   type DirectUploadTarget,

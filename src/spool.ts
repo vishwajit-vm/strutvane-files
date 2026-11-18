@@ -22,7 +22,7 @@ import { mkdtemp, open, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
-import type { FileBody } from '@strutvane/contracts'
+import type { FileBody } from '@strutvane/framework/contracts'
 import { SNIFF_BYTES } from './mime.ts'
 
 /** A body copied to a temp file. Dispose it (`await using`) to delete the file. */

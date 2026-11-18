@@ -24,8 +24,8 @@ import {
   StorageSharedKeyCredential,
   type UserDelegationKey,
 } from '@azure/storage-blob'
-import type { FileBody, FileListPage, StoredFile } from '@strutvane/contracts'
-import { NotFoundError } from '@strutvane/core'
+import type { FileBody, FileListPage, StoredFile } from '@strutvane/framework/contracts'
+import { NotFoundError } from '@strutvane/framework/core'
 import {
   clampExpiry,
   type DirectUploadTarget,

@@ -1,4 +1,4 @@
-import { NotFoundError } from '@strutvane/core'
+import { NotFoundError } from '@strutvane/framework/core'
 import { describe, expect, test } from 'vitest'
 import { StorageUnavailableError, UnsafeKeyError } from '../src/errors.ts'
 import { createFileManager } from '../src/manager.ts'

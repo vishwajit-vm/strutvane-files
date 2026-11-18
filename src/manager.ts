@@ -23,8 +23,8 @@ import type {
   FileVisibility,
   Logger,
   StorageDisk,
-} from '@strutvane/contracts'
-import { type Clock, NotFoundError, systemClock, uuidv7, ValidationError } from '@strutvane/core'
+} from '@strutvane/framework/contracts'
+import { type Clock, NotFoundError, systemClock, uuidv7, ValidationError } from '@strutvane/framework/core'
 import {
   type DirectUploadTarget,
   type FilesTemporaryUrlOptions,

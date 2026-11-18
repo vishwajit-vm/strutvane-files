@@ -7,7 +7,7 @@ import {
   StorageSharedKeyCredential,
   type UserDelegationKey,
 } from '@azure/storage-blob'
-import { NotFoundError } from '@strutvane/core'
+import { NotFoundError } from '@strutvane/framework/core'
 import { describe, expect, test, vi } from 'vitest'
 import { AzureBlobDisk } from '../src/azure/disk.ts'
 import { createAzureBlobDisk } from '../src/azure/factory.ts'

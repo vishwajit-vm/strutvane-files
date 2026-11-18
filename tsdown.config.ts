@@ -1,10 +1,13 @@
 import { defineConfig } from 'tsdown'
 
-// One entry per subpath export. Cloud SDKs and sharp are optional peers: they are never bundled,
-// and only the subpath that needs one imports it, so `@strutvane/files` itself stays light.
+// One entry per subpath export. The framework is a peer (one copy per app: container tokens and
+// `instanceof` rely on it), and the cloud SDKs and sharp are optional peers: none of them is ever
+// bundled, and only the subpath that needs an SDK imports it, so `@strutvane/files` stays light.
 export default defineConfig({
   entry: {
     index: 'src/index.ts',
+    provider: 'src/provider.ts',
+    installer: 'src/installer.ts',
     s3: 'src/s3/index.ts',
     azure: 'src/azure/index.ts',
     images: 'src/images/index.ts',
@@ -19,12 +22,9 @@ export default defineConfig({
   clean: true,
   deps: {
     neverBundle: [
-      '@strutvane/contracts',
-      '@strutvane/core',
-      '@aws-sdk/client-s3',
-      '@aws-sdk/s3-request-presigner',
-      '@azure/storage-blob',
-      '@azure/identity',
+      /^@strutvane\/framework(\/.*)?$/,
+      /^@aws-sdk\//,
+      /^@azure\//,
       'sharp',
     ],
   },

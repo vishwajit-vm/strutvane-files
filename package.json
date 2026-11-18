@@ -1,7 +1,7 @@
 {
   "name": "@strutvane/files",
   "version": "0.1.0-next.0",
-  "description": "Cloud storage disks (S3, R2, MinIO, Azure Blob), file and image fields, magic-byte validation, EXIF/GPS stripping, virus scanning, per-tenant quotas, attachments with orphan cleanup, and presigned direct-to-cloud uploads.",
+  "description": "Cloud storage for Strutvane apps: S3 (and R2, MinIO, Spaces) and Azure Blob disks from config/filesystems.ts, presigned and resumable direct-to-cloud uploads, magic-byte validation, EXIF/GPS stripping, virus scanning with quarantine, per-tenant quotas and attachments with orphan cleanup.",
   "keywords": [
     "strutvane",
     "file-upload",
@@ -31,6 +31,14 @@
       "types": "./dist/index.d.mts",
       "default": "./dist/index.mjs"
     },
+    "./provider": {
+      "types": "./dist/provider.d.mts",
+      "default": "./dist/provider.mjs"
+    },
+    "./installer": {
+      "types": "./dist/installer.d.mts",
+      "default": "./dist/installer.mjs"
+    },
     "./s3": {
       "types": "./dist/s3.d.mts",
       "default": "./dist/s3.mjs"
@@ -56,12 +64,19 @@
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "CHANGELOG.md"
   ],
   "engines": {
-    "node": ">=24"
+    "node": ">=24.3"
   },
-  "packageManager": "pnpm@12.18.0",
+  "devEngines": {
+    "packageManager": {
+      "name": "npm",
+      "version": ">=11.19.0",
+      "onFail": "error"
+    }
+  },
   "publishConfig": {
     "access": "public",
     "provenance": true
@@ -80,11 +95,23 @@
     "version-packages": "changeset version",
     "release": "changeset publish"
   },
-  "dependencies": {
-    "@strutvane/contracts": "0.1.0-next.0",
-    "@strutvane/core": "0.1.0-next.0"
+  "strutvane": {
+    "id": "files",
+    "name": "Cloud files",
+    "description": "S3 and Azure Blob disks, presigned and resumable uploads, virus scanning, quotas",
+    "category": "back-office",
+    "tags": [
+      "s3",
+      "azure",
+      "storage",
+      "uploads"
+    ],
+    "compat": "^0.2.0-next.0",
+    "installer": "./dist/installer.mjs",
+    "docs": "https://github.com/vishwajit-vm/strutvane-files#readme"
   },
   "peerDependencies": {
+    "@strutvane/framework": "^0.2.0-next.0",
     "@aws-sdk/client-s3": "^3.1100.0",
     "@aws-sdk/s3-request-presigner": "^3.1100.0",
     "@azure/identity": "^4.10.0",
@@ -115,6 +142,7 @@
     "@azure/storage-blob": "12.34.0",
     "@biomejs/biome": "2.6.7",
     "@changesets/cli": "3.0.3",
+    "@strutvane/framework": "0.2.0-next.0",
     "@types/node": "24.19.2",
     "@types/pg": "8.23.1",
     "@vitest/coverage-v8": "5.1.0",
@@ -124,5 +152,11 @@
     "tsdown": "0.23.7",
     "typescript": "6.0.3",
     "vitest": "5.1.0"
+  },
+  "allowScripts": {
+    "esbuild@0.18.20": true,
+    "esbuild@0.25.12": true,
+    "esbuild@0.28.2": true,
+    "fsevents@2.3.3": false
   }
 }

@@ -6,7 +6,7 @@
  *
  * @module
  */
-import { defineMessages, type MessageCatalog } from '@strutvane/core'
+import { defineMessages, type MessageCatalog } from '@strutvane/framework/core'
 
 /** The package catalog for `en`. */
 export const FILES_MESSAGES_EN: MessageCatalog = defineMessages('en', {
@@ -14,11 +14,11 @@ export const FILES_MESSAGES_EN: MessageCatalog = defineMessages('en', {
   'validation.file_corrupt': '{attribute} could not be read. Please upload a valid file.',
   'validation.image_dimensions_invalid':
     '{attribute} must be between {minWidth}x{minHeight} and {maxWidth}x{maxHeight} pixels.',
-  'errors.FILE_INFECTED.detail': 'The file was rejected by the virus scanner.',
-  'errors.SCAN_UNAVAILABLE.detail': 'Files cannot be checked right now. Please try again shortly.',
-  'errors.STORAGE_UNAVAILABLE.detail':
+  'errors.file_infected.detail': 'The file was rejected by the virus scanner.',
+  'errors.scan_unavailable.detail': 'Files cannot be checked right now. Please try again shortly.',
+  'errors.storage_unavailable.detail':
     'Files cannot be saved right now. Please try again in a moment.',
-  'errors.QUOTA_EXCEEDED.detail':
+  'errors.quota_exceeded.detail':
     'This upload needs {requested} bytes, but only {available} of {limit} bytes are free.',
-  'errors.UPLOAD_INCOMPLETE.detail': 'The upload did not finish. Please upload the file again.',
+  'errors.upload_incomplete.detail': 'The upload did not finish. Please upload the file again.',
 })

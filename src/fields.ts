@@ -22,8 +22,8 @@ import type {
   SqlDialect,
   StandardSchemaV1,
   StandardSchemaV1Issue,
-} from '@strutvane/contracts'
-import { createMessages, isUuidV7 } from '@strutvane/core'
+} from '@strutvane/framework/contracts'
+import { createMessages, isUuidV7 } from '@strutvane/framework/core'
 import { type FileIssue, fileIssue } from './errors.ts'
 import { FILES_MESSAGES_EN } from './messages.ts'
 import {

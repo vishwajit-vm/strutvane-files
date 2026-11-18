@@ -10,7 +10,7 @@
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { StorageDisk, StoredFile } from '@strutvane/contracts'
+import type { StorageDisk, StoredFile } from '@strutvane/framework/contracts'
 import sharp from 'sharp'
 import { putSpooled } from '../disk.ts'
 import { DEFAULT_RULES } from '../rules.ts'

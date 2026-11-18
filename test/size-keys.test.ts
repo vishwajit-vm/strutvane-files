@@ -1,4 +1,4 @@
-import { NotFoundError } from '@strutvane/core'
+import { NotFoundError } from '@strutvane/framework/core'
 import fc from 'fast-check'
 import { describe, expect, test } from 'vitest'
 import { UnsafeKeyError } from '../src/errors.ts'

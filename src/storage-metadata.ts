@@ -10,7 +10,7 @@
  *
  * @module
  */
-import type { FileVisibility } from '@strutvane/contracts'
+import type { FileVisibility } from '@strutvane/framework/contracts'
 
 /** The total metadata budget in bytes (S3's limit). */
 export const METADATA_LIMIT = 2048

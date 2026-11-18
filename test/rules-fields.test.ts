@@ -1,5 +1,5 @@
-import type { StandardSchemaV1FailureResult } from '@strutvane/contracts'
-import { createMessages, ValidationError } from '@strutvane/core'
+import type { StandardSchemaV1FailureResult } from '@strutvane/framework/contracts'
+import { createMessages, ValidationError } from '@strutvane/framework/core'
 import { describe, expect, test } from 'vitest'
 import {
   FileInfectedError,
@@ -236,19 +236,19 @@ describe('errors and messages', () => {
   test('operation errors carry RFC-0002 codes, statuses and Retry-After', () => {
     const storage = new StorageUnavailableError('s3', { retryAfterSeconds: 7.2 })
     expect([storage.code, storage.status, storage.headers['Retry-After']]).toEqual([
-      'STORAGE_UNAVAILABLE',
+      'storage_unavailable',
       503,
       '8',
     ])
     const scan = new ScanUnavailableError({ cause: new Error('down') })
     expect([scan.code, scan.status, scan.headers['Retry-After']]).toEqual([
-      'SCAN_UNAVAILABLE',
+      'scan_unavailable',
       503,
       '30',
     ])
     const infected = new FileInfectedError('Eicar-Signature')
     expect([infected.code, infected.status, infected.signature]).toEqual([
-      'FILE_INFECTED',
+      'file_infected',
       422,
       'Eicar-Signature',
     ])
@@ -256,8 +256,8 @@ describe('errors and messages', () => {
     const quota = new QuotaExceededError({ limit: 100, used: 90, requested: 20 })
     expect(quota.params).toEqual({ limit: 100, used: 90, requested: 20, available: 10 })
     expect(new UploadIncompleteError().status).toBe(400)
-    expect(new FileRejectedError('FILE_TOO_LARGE', { max: '1 KB' }).status).toBe(422)
-    expect(new FileRejectedError('FILE_EMPTY').params).toEqual({})
+    expect(new FileRejectedError('file_too_large', { max: '1 KB' }).status).toBe(422)
+    expect(new FileRejectedError('file_empty').params).toEqual({})
     expect(() => throwFileIssues([fileIssue('file_empty', ['a'])])).toThrow(ValidationError)
   })
 
@@ -267,7 +267,7 @@ describe('errors and messages', () => {
       'Logo must be at least 1 KB.',
     )
     expect(
-      messages.format('errors.QUOTA_EXCEEDED.detail', { requested: 5, available: 1, limit: 10 }),
+      messages.format('errors.quota_exceeded.detail', { requested: 5, available: 1, limit: 10 }),
     ).toContain('5 bytes')
     for (const key of Object.keys(FILES_MESSAGES_EN.messages)) expect(messages.has(key)).toBe(true)
   })

@@ -11,7 +11,7 @@
  *
  * @module
  */
-import { NotFoundError, uuidv7 } from '@strutvane/core'
+import { NotFoundError, uuidv7 } from '@strutvane/framework/core'
 import { UnsafeKeyError } from './errors.ts'
 import { extensionFor } from './mime.ts'
 

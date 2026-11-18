@@ -7,8 +7,8 @@ import type {
   PutOptions,
   StorageDisk,
   StoredFile,
-} from '@strutvane/contracts'
-import { NotFoundError } from '@strutvane/core'
+} from '@strutvane/framework/contracts'
+import { NotFoundError } from '@strutvane/framework/core'
 import type { DirectUploadTarget, PresignUploadOptions } from '../../src/disk.ts'
 import { assertSafeKey, assertSafePrefix } from '../../src/keys.ts'
 import { toWebStream } from '../../src/spool.ts'

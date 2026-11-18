@@ -20,7 +20,7 @@ import {
   StrutvaneError,
   type StrutvaneErrorOptions,
   ValidationError,
-} from '@strutvane/core'
+} from '@strutvane/framework/core'
 
 /** Issue codes for per-file validation problems (keys under `validation.` in the catalog). */
 export const FILE_ISSUE_CODES: readonly FileIssueCode[] = [
@@ -85,7 +85,7 @@ export class StorageUnavailableError extends StrutvaneError {
     disk: string,
     options: OperationOptions & { readonly retryAfterSeconds?: number } = {},
   ) {
-    super('STORAGE_UNAVAILABLE', {
+    super('storage_unavailable', {
       status: 503,
       ...causeOf(options),
       headers: retryAfter(options.retryAfterSeconds ?? 5),
@@ -97,7 +97,7 @@ export class StorageUnavailableError extends StrutvaneError {
 /** The virus scanner could not be reached or did not answer. 503 (the fail-closed default). */
 export class ScanUnavailableError extends StrutvaneError {
   constructor(options: OperationOptions & { readonly retryAfterSeconds?: number } = {}) {
-    super('SCAN_UNAVAILABLE', {
+    super('scan_unavailable', {
       status: 503,
       ...causeOf(options),
       headers: retryAfter(options.retryAfterSeconds ?? 30),
@@ -113,7 +113,7 @@ export class ScanUnavailableError extends StrutvaneError {
 export class FileInfectedError extends StrutvaneError {
   readonly signature: string
   constructor(signature: string, options: OperationOptions = {}) {
-    super('FILE_INFECTED', { status: 422, ...causeOf(options) })
+    super('file_infected', { status: 422, ...causeOf(options) })
     this.signature = signature
   }
 }
@@ -125,7 +125,7 @@ export class QuotaExceededError extends StrutvaneError {
     readonly used: number
     readonly requested: number
   }) {
-    super('QUOTA_EXCEEDED', {
+    super('quota_exceeded', {
       status: 422,
       params: { ...params, available: Math.max(0, params.limit - params.used) },
     })
@@ -135,7 +135,7 @@ export class QuotaExceededError extends StrutvaneError {
 /** A direct upload was confirmed, but the object never arrived (or arrived partially). 400. */
 export class UploadIncompleteError extends StrutvaneError {
   constructor(options: OperationOptions = {}) {
-    super('UPLOAD_INCOMPLETE', { status: 400, ...causeOf(options) })
+    super('upload_incomplete', { status: 400, ...causeOf(options) })
   }
 }
 
@@ -148,11 +148,11 @@ export class UploadIncompleteError extends StrutvaneError {
 export class FileRejectedError extends StrutvaneError {
   constructor(
     code:
-      | 'FILE_TOO_LARGE'
-      | 'FILE_TYPE_NOT_ALLOWED'
-      | 'FILE_EMPTY'
-      | 'FILE_CORRUPT'
-      | 'IMAGE_DIMENSIONS_INVALID',
+      | 'file_too_large'
+      | 'file_type_not_allowed'
+      | 'file_empty'
+      | 'file_corrupt'
+      | 'image_dimensions_invalid',
     params?: ErrorParams,
   ) {
     super(code, { status: 422, ...(params ? { params } : {}) })

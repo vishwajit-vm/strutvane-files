@@ -5,7 +5,7 @@
  *
  * @module
  */
-import type { FileVisibility, PutOptions, StorageDisk, StoredFile } from '@strutvane/contracts'
+import type { FileVisibility, PutOptions, StorageDisk, StoredFile } from '@strutvane/framework/contracts'
 import type { SpooledFile } from './spool.ts'
 
 /** Extra put options understood by this package's disks (ignored by others). */

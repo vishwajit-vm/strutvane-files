@@ -1,5 +1,5 @@
 // Type-level tests: the public API satisfies the contracts, and misuse fails to compile.
-import type { FieldType, StorageDisk } from '@strutvane/contracts'
+import type { FieldType, StorageDisk } from '@strutvane/framework/contracts'
 import { describe, expectTypeOf, test } from 'vitest'
 import type { AzureBlobDisk } from '../src/azure/disk.ts'
 import type { PresigningDisk, SpoolAwareDisk } from '../src/disk.ts'

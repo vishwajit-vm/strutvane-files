@@ -1,6 +1,6 @@
 // AzureBlobDisk against Azurite (the official Azure Storage emulator).
 import { BlobServiceClient } from '@azure/storage-blob'
-import { NotFoundError } from '@strutvane/core'
+import { NotFoundError } from '@strutvane/framework/core'
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import type { AzureBlobDisk } from '../../src/azure/disk.ts'
 import { createAzureBlobDisk } from '../../src/azure/factory.ts'

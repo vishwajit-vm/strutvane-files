@@ -68,7 +68,7 @@ describe('withRetry', () => {
     ).catch((e: unknown) => e)
     expect(error).toBeInstanceOf(StorageUnavailableError)
     const e = error as StorageUnavailableError
-    expect(e.code).toBe('STORAGE_UNAVAILABLE')
+    expect(e.code).toBe('storage_unavailable')
     expect(e.status).toBe(503)
     expect(e.headers['Retry-After']).toBe('5')
     expect(e.disk).toBe('azure')

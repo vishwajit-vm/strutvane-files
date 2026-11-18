@@ -1,8 +1,8 @@
 import { mkdtemp, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { Logger } from '@strutvane/contracts'
-import { createTestClock, NotFoundError, ValidationError } from '@strutvane/core'
+import type { Logger } from '@strutvane/framework/contracts'
+import { createTestClock, NotFoundError, ValidationError } from '@strutvane/framework/core'
 import sharp from 'sharp'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import {

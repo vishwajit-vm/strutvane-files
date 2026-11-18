@@ -22,7 +22,7 @@
  *
  * @module
  */
-import type { FileVisibility } from '@strutvane/contracts'
+import type { FileVisibility } from '@strutvane/framework/contracts'
 import type { ScanStatus } from './scan.ts'
 
 /** Where a file is in its lifecycle. See the module docs. */

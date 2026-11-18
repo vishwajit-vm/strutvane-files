@@ -1,5 +1,5 @@
 import { readFile } from 'node:fs/promises'
-import { ValidationError } from '@strutvane/core'
+import { ValidationError } from '@strutvane/framework/core'
 import sharp from 'sharp'
 import { describe, expect, test } from 'vitest'
 import { ImageProcessingError, type ImageProcessor } from '../src/image-processor.ts'
